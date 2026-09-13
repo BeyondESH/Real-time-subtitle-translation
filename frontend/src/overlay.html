@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>字幕</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+      font-family: 'Microsoft YaHei', sans-serif;
+    }
+
+    #subtitle-container {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      align-items: center;
+      padding: 20px;
+      background: transparent;
+    }
+
+    .subtitle-line {
+      text-align: center;
+      margin: 5px 0;
+      max-width: 90%;
+      word-wrap: break-word;
+    }
+
+    .original-text {
+      font-size: 20px;
+      color: #CCCCCC;
+      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+    }
+
+    .translation-text {
+      font-size: 28px;
+      color: #FFFFFF;
+      font-weight: bold;
+      text-shadow: 
+        2px 2px 4px rgba(0, 0, 0, 0.9),
+        -1px -1px 0 rgba(0, 0, 0, 0.5),
+        1px -1px 0 rgba(0, 0, 0, 0.5),
+        -1px 1px 0 rgba(0, 0, 0, 0.5),
+        1px 1px 0 rgba(0, 0, 0, 0.5);
+    }
+
+    /* 拖拽区域指示器（仅在调试时显示） */
+    #drag-handle {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 10px;
+      cursor: move;
+    }
+
+    #drag-handle:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    /* 调试模式样式 */
+    .debug-mode #drag-handle {
+      background: rgba(255, 0, 0, 0.3);
+    }
+
+    /* 模型下载进度样式 */
+    #model-progress {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: rgba(0, 0, 0, 0.85);
+      border-radius: 8px;
+      padding: 15px 20px;
+      min-width: 300px;
+      display: none;
+      z-index: 1000;
+    }
+
+    #model-progress.visible {
+      display: block;
+    }
+
+    .progress-title {
+      color: #4FC3F7;
+      font-size: 14px;
+      margin-bottom: 10px;
+      font-weight: bold;
+    }
+
+    .progress-model {
+      color: #FFFFFF;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+
+    .progress-bar-container {
+      background: #333;
+      border-radius: 4px;
+      height: 8px;
+      overflow: hidden;
+      margin-bottom: 8px;
+    }
+
+    .progress-bar {
+      background: linear-gradient(90deg, #4FC3F7, #29B6F6);
+      height: 100%;
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+
+    .progress-status {
+      color: #B0BEC5;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <!-- 模型下载进度 -->
+  <div id="model-progress">
+    <div class="progress-title">模型下载中...</div>
+    <div class="progress-model" id="progress-model-name">--</div>
+    <div class="progress-bar-container">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+    <div class="progress-status" id="progress-status">准备中...</div>
+  </div>
+
+  <div id="subtitle-container">
+    <div id="drag-handle"></div>
+    <div id="subtitles"></div>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+
+    // WebSocket 连接
+    let ws = null;
+    let isPaused = false;
+    let subtitleHistory = [];
+    const MAX_HISTORY = 5;
+
+    // 连接 WebSocket
+    function connectWebSocket() {
+      ws = new WebSocket('ws://localhost:8765');
+
+      ws.onopen = () => {
+        console.log('WebSocket 已连接');
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        handleMessage(data);
+      };
+
+      ws.onclose = () => {
+        console.log('WebSocket 断开，3秒后重连...');
+        setTimeout(connectWebSocket, 3000);
+      };
+
+      ws.onerror = (error) => {
+        console.error('WebSocket 错误:', error);
+      };
+    }
+
+    // 处理所有消息
+    function handleMessage(data) {
+      if (data.type === 'subtitle') {
+        handleSubtitleData(data);
+      } else if (data.type === 'model_progress') {
+        handleModelProgress(data);
+      }
+    }
+
+    // 处理模型下载进度
+    function handleModelProgress(data) {
+      const progressContainer = document.getElementById('model-progress');
+      const modelName = document.getElementById('progress-model-name');
+      const progressBar = document.getElementById('progress-bar');
+      const progressStatus = document.getElementById('progress-status');
+
+      // 显示进度条
+      progressContainer.classList.add('visible');
+
+      // 更新模型名称
+      modelName.textContent = data.model_name;
+
+      // 更新进度条
+      progressBar.style.width = data.progress + '%';
+
+      // 更新状态
+      progressStatus.textContent = data.message;
+
+      // 如果进度完成，3秒后隐藏
+      if (data.progress >= 100) {
+        setTimeout(() => {
+          progressContainer.classList.remove('visible');
+        }, 3000);
+      }
+    }
+
+    // 处理字幕数据
+    function handleSubtitleData(data) {
+      if (isPaused) return;
+
+      if (data.type === 'subtitle') {
+        subtitleHistory.push(data);
+        if (subtitleHistory.length > MAX_HISTORY) {
+          subtitleHistory.shift();
+        }
+        updateSubtitleDisplay();
+      }
+    }
+
+    // 更新字幕显示
+    function updateSubtitleDisplay() {
+      const container = document.getElementById('subtitles');
+      container.innerHTML = '';
+
+      subtitleHistory.forEach((item, index) => {
+        const line = document.createElement('div');
+        line.className = 'subtitle-line';
+
+        // 显示翻译（主要）
+        const translation = document.createElement('div');
+        translation.className = 'translation-text';
+        translation.textContent = item.translations?.zh || item.original;
+        line.appendChild(translation);
+
+        // 显示原文（次要）
+        if (item.original && item.source_language !== 'zh') {
+          const original = document.createElement('div');
+          original.className = 'original-text';
+          original.textContent = item.original;
+          line.appendChild(original);
+        }
+
+        container.appendChild(line);
+      });
+    }
+
+    // IPC 事件监听
+    ipcRenderer.on('toggle-pause', (event, paused) => {
+      isPaused = paused;
+    });
+
+    ipcRenderer.on('switch-language', () => {
+      // TODO: 实现语言切换逻辑
+    });
+
+    // 鼠标事件处理（拖拽）
+    let isDragging = false;
+    let dragOffset = { x: 0, y: 0 };
+
+    const dragHandle = document.getElementById('drag-handle');
+
+    dragHandle.addEventListener('mousedown', (e) => {
+      isDragging = true;
+      dragOffset.x = e.screenX;
+      dragOffset.y = e.screenY;
+      ipcRenderer.send('set-ignore-mouse', false);
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (isDragging) {
+        // 通过 IPC 通知主进程移动窗口
+        // 实际实现需要主进程支持
+      }
+    });
+
+    document.addEventListener('mouseup', () => {
+      isDragging = false;
+      ipcRenderer.send('set-ignore-mouse', true);
+    });
+
+    // 鼠标进入/离开时切换穿透
+    document.addEventListener('mouseenter', () => {
+      ipcRenderer.send('set-ignore-mouse', false);
+    });
+
+    document.addEventListener('mouseleave', () => {
+      ipcRenderer.send('set-ignore-mouse', true);
+    });
+
+    // 启动连接
+    connectWebSocket();
+  </script>
+</body>
+</html>

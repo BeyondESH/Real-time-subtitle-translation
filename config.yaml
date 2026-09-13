@@ -1,0 +1,75 @@
+# 实时字幕翻译软件配置文件
+
+# 音频设置
+audio:
+  # 采样率 (Hz)
+  sample_rate: 16000
+  # 声道数 (1=单声道, 2=立体声)
+  channels: 1
+  # 音频块大小
+  chunk_size: 1024
+  # 音频源选择 (null=默认设备, 或指定应用名称)
+  source_app: null
+
+# ASR 设置
+asr:
+  # Whisper 模型大小: tiny, base, small, medium, large-v3
+  model_size: base
+  # 设备: auto, cpu, cuda
+  device: auto
+  # 源语言 (null=自动检测, 或指定语言代码如 'ja', 'en', 'zh')
+  language: null
+  # 计算类型: float16, int8_float16, int8
+  compute_type: float16
+
+# 翻译设置
+translation:
+  # 日中专用模型
+  primary_model: Helsinki-NLP/opus-mt-ja-zh
+  # 全语种模型
+  fallback_model: facebook/nllb-200-distilled-600M
+  # 目标语言列表
+  target_languages:
+    - zh  # 中文
+    - en  # 英文
+  # 翻译设备: auto, cpu, cuda
+  device: auto
+
+# WebSocket 设置
+websocket:
+  host: localhost
+  port: 8765
+
+# 字幕显示设置
+subtitle:
+  # 字体设置
+  font:
+    family: "Microsoft YaHei"
+    size: 24
+    color: "#FFFFFF"
+    stroke_color: "#000000"
+    stroke_width: 2
+  # 窗口设置
+  window:
+    width: 800
+    height: 200
+    x: null  # null=居中
+    y: null  # null=底部
+    opacity: 0.9
+  # 显示模式: translation_only, original_and_translation
+  display_mode: original_and_translation
+
+# 快捷键设置
+shortcuts:
+  toggle_pause: "Ctrl+Shift+Space"
+  switch_language: "Ctrl+Shift+L"
+  switch_model: "Ctrl+Shift+M"
+
+# 系统设置
+system:
+  # 开机自启动
+  auto_start: false
+  # 最小化到托盘
+  minimize_to_tray: true
+  # 日志级别: DEBUG, INFO, WARNING, ERROR
+  log_level: INFO

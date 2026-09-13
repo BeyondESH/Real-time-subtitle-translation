@@ -1,0 +1,56 @@
+appId: com.subtitle-translator
+productName: 实时字幕翻译
+copyright: Copyright © 2024
+
+directories:
+  output: release
+  buildResources: resources
+
+files:
+  - dist/**/*
+  - src/**/*
+  - node_modules/**/*
+
+extraResources:
+  - from: ../backend/dist/
+    to: backend/
+  - from: ../config.yaml
+    to: config.yaml
+  - from: ../models/
+    to: models/
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: src/icon.ico
+  artifactName: ${productName}-${version}-win-${arch}.exe
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 实时字幕翻译
+  uninstallDisplayName: 实时字幕翻译
+  artifactName: ${productName}-${version}-setup-${arch}.exe
+
+mac:
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  icon: src/icon.icns
+  category: public.app-category.utilities
+
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+  icon: src/icon.png
+  category: Utility
