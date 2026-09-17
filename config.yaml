@@ -1,4 +1,8 @@
 # 实时字幕翻译软件配置文件
+#
+# 本文件仅承载【后端管线参数】。
+# 前端偏好（字幕样式/窗口/快捷键/主题/开机自启等）由客户端 electron-store 管理，
+# 不再从此文件读取（旧副本中的这些段会在客户端升级首启时一次性迁移导入）。
 
 # 音频设置
 audio:
@@ -8,8 +12,28 @@ audio:
   channels: 1
   # 音频块大小
   chunk_size: 1024
-  # 音频源选择 (null=默认设备, 或指定应用名称)
+  # 音频源选择 (null=默认回环设备)
   source_app: null
+
+# 管线设置
+pipeline:
+  # 环形缓冲区容量（秒）
+  buffer_seconds: 30
+  # 切句分析周期（毫秒）
+  tick_ms: 250
+  # 单条语句最大时长（秒），超过强制切分
+  max_utterance_s: 15
+  # 语句队列深度（满时丢最旧并告警）
+  queue_size: 8
+
+# VAD 设置 (faster-whisper 内置 Silero VAD)
+vad:
+  # 语音判定阈值 (0-1)
+  threshold: 0.5
+  # 句尾静音判定时长（毫秒），超过则切句
+  min_silence_duration_ms: 600
+  # 语句边界外扩（毫秒）
+  speech_pad_ms: 200
 
 # ASR 设置
 asr:
@@ -34,42 +58,13 @@ translation:
     - en  # 英文
   # 翻译设备: auto, cpu, cuda
   device: auto
+  # NLLB 是否按需懒加载（首次用到才加载）
+  lazy_load: true
+  # 启动后是否后台预载日中主模型
+  preload_primary: true
 
 # WebSocket 设置
 websocket:
   host: localhost
   port: 8765
 
-# 字幕显示设置
-subtitle:
-  # 字体设置
-  font:
-    family: "Microsoft YaHei"
-    size: 24
-    color: "#FFFFFF"
-    stroke_color: "#000000"
-    stroke_width: 2
-  # 窗口设置
-  window:
-    width: 800
-    height: 200
-    x: null  # null=居中
-    y: null  # null=底部
-    opacity: 0.9
-  # 显示模式: translation_only, original_and_translation
-  display_mode: original_and_translation
-
-# 快捷键设置
-shortcuts:
-  toggle_pause: "Ctrl+Shift+Space"
-  switch_language: "Ctrl+Shift+L"
-  switch_model: "Ctrl+Shift+M"
-
-# 系统设置
-system:
-  # 开机自启动
-  auto_start: false
-  # 最小化到托盘
-  minimize_to_tray: true
-  # 日志级别: DEBUG, INFO, WARNING, ERROR
-  log_level: INFO

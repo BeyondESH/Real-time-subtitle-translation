@@ -45,7 +45,14 @@ class ASREngine:
 
         self._model: Optional[WhisperModel] = None
         self._initialized = False
+        self._switching = False
+        self._switch_lock: Optional[asyncio.Lock] = None  # 延迟创建（需事件循环）
         self._download_progress_callback: Optional[DownloadProgressCallback] = None
+
+    @property
+    def is_ready(self) -> bool:
+        """模型已初始化且不在切换中"""
+        return self._initialized and not self._switching
 
     def _detect_device(self) -> str:
         """
@@ -221,10 +228,13 @@ class ASREngine:
 
     async def change_model(self, model_size: str):
         """
-        切换 Whisper 模型
+        切换 Whisper 模型（锁串行化，切换期间 is_ready=False，语句被丢弃）
 
         Args:
             model_size: 新的模型大小
+
+        Raises:
+            ValueError: 模型名不受支持
         """
         if model_size not in self.SUPPORTED_MODELS:
             raise ValueError(f"不支持的模型: {model_size}，支持: {self.SUPPORTED_MODELS}")
@@ -233,12 +243,20 @@ class ASREngine:
             logger.info(f"模型 {model_size} 已加载")
             return
 
-        logger.info(f"切换模型: {self.model_size} -> {model_size}")
-        self.model_size = model_size
-        self._initialized = False
-        self._model = None
+        if self._switch_lock is None:
+            self._switch_lock = asyncio.Lock()
 
-        await self.initialize()
+        async with self._switch_lock:
+            self._switching = True
+            try:
+                logger.info(f"切换模型: {self.model_size} -> {model_size}")
+                self.model_size = model_size
+                self._initialized = False
+                self._model = None  # 释放旧模型
+
+                await self.initialize()
+            finally:
+                self._switching = False
 
     def get_model_info(self) -> dict:
         """
