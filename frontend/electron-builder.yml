@@ -2,30 +2,39 @@ appId: com.subtitle-translator
 productName: 实时字幕翻译
 copyright: Copyright © 2024
 
+# 自动更新发布源（release-packaging spec "自动更新"）
+publish:
+  - provider: github
+    owner: BeyondESH
+    repo: Real-time-subtitle-translation
+
 directories:
   output: release
-  buildResources: resources
 
 files:
-  - dist/**/*
-  - src/**/*
-  - node_modules/**/*
+  - out/**/*
+  - resources/**/*
+  - package.json
 
+# 原生模块必须解包（asar 内 .node 无法 dlopen）
+asarUnpack:
+  - node_modules/better-sqlite3/**
+
+# 后端可执行文件与默认配置随包分发（模型首次运行下载，不内嵌）
 extraResources:
   - from: ../backend/dist/
     to: backend/
   - from: ../config.yaml
     to: config.yaml
-  - from: ../models/
-    to: models/
 
+# 仅 Windows（WASAPI 限定）
 win:
   target:
     - target: nsis
       arch:
         - x64
-  icon: src/icon.ico
-  artifactName: ${productName}-${version}-win-${arch}.exe
+  icon: resources/icon.ico
+  artifactName: ${name}-${version}-win-${arch}.exe
 
 nsis:
   oneClick: false
@@ -36,21 +45,6 @@ nsis:
   createStartMenuShortcut: true
   shortcutName: 实时字幕翻译
   uninstallDisplayName: 实时字幕翻译
-  artifactName: ${productName}-${version}-setup-${arch}.exe
-
-mac:
-  target:
-    - target: dmg
-      arch:
-        - x64
-        - arm64
-  icon: src/icon.icns
-  category: public.app-category.utilities
-
-linux:
-  target:
-    - target: AppImage
-      arch:
-        - x64
-  icon: src/icon.png
-  category: Utility
+  # 产物名必须 ASCII（${name}）：electron-updater 按 latest.yml 的 url 下载 GitHub Release 资产，
+  # 非 ASCII productName 会导致 latest.yml 记录名与实际文件名不一致 → 更新 404
+  artifactName: ${name}-${version}-setup-${arch}.exe

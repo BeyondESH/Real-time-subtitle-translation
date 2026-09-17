@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    /* 背景色不落在 body：主窗口根容器自带 bg-base，字幕悬浮窗需要透明 body */
+    @apply font-ui text-base text-primary antialiased;
+  }
+
+  ::selection {
+    @apply bg-accent text-onaccent;
+  }
+}
+
+/* design-system spec：系统"减少动态效果"时关闭位移与装饰性动效 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

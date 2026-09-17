@@ -1,0 +1,34 @@
+/**
+ * 应用级动效样式（design-system spec：250ms 淡入上浮入场；
+ * prefers-reduced-motion 的全局降级已在 base.css 兜底）
+ */
+
+.caption-enter {
+  animation: caption-enter var(--motion-slow) var(--ease-app) both;
+}
+
+@keyframes caption-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.panel-enter {
+  animation: panel-enter var(--motion-fast) var(--ease-app) both;
+}
+
+@keyframes panel-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

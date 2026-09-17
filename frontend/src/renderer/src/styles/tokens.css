@@ -1,0 +1,63 @@
+/**
+ * 设计 Token 唯一来源（design-system spec）
+ *
+ * 全部色值/圆角/字体/动效在此定义；组件层禁止硬编码任何颜色字面量
+ * （color-scan.test.ts 强制执行，本文件是唯一豁免）。
+ * 例外：字幕悬浮窗文字样式由用户配置驱动（subtitle-display spec）。
+ *
+ * 暗色 = 默认（:root）；亮色经 [data-theme="light"] 覆盖。
+ */
+:root {
+  /* ---- 色彩：暗色（默认） ---- */
+  --color-bg-base: #0d0d0d;
+  --color-bg-sidebar: #171717;
+  --color-bg-elevated: #1e1e1e;
+  --color-bg-surface-hover: #262626;
+  --color-border: rgba(255, 255, 255, 0.08);
+  --color-border-strong: rgba(255, 255, 255, 0.16);
+  --color-text-primary: #ececec;
+  --color-text-secondary: #9a9a9a;
+  --color-accent: #10a37f;
+  --color-accent-hover: #0e8f70;
+  --color-on-accent: #ffffff;
+  --color-ok: #4ade80;
+  --color-warn: #fbbf24;
+  --color-danger: #f87171;
+  --color-ring: #10a37f;
+  --color-backdrop: rgba(0, 0, 0, 0.6);
+
+  /* ---- 字体 ---- */
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, "Microsoft YaHei", sans-serif;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+
+  /* ---- 圆角 ---- */
+  --radius-card: 12px;
+  --radius-control: 8px;
+  --radius-pill: 999px;
+
+  /* ---- 动效 ---- */
+  --motion-fast: 150ms;
+  --motion-normal: 200ms;
+  --motion-slow: 250ms;
+  --ease-app: cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+/* ---- 色彩：亮色 ---- */
+:root[data-theme='light'] {
+  --color-bg-base: #ffffff;
+  --color-bg-sidebar: #f9f9f9;
+  --color-bg-elevated: #f2f2f2;
+  --color-bg-surface-hover: #e8e8e8;
+  --color-border: rgba(0, 0, 0, 0.08);
+  --color-border-strong: rgba(0, 0, 0, 0.16);
+  --color-text-primary: #1a1a1a;
+  --color-text-secondary: #6b6b6b;
+  --color-accent: #10a37f;
+  --color-accent-hover: #0d8a6b;
+  --color-on-accent: #ffffff;
+  --color-backdrop: rgba(0, 0, 0, 0.35);
+}

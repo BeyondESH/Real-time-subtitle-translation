@@ -50,6 +50,7 @@ yarn-error.log*
 
 # Electron
 frontend/dist/
+frontend/out/
 frontend/release/
 frontend/*.tgz
 
@@ -63,3 +64,14 @@ logs/
 # Temporary files
 tmp/
 temp/
+.codemap/
+.omo/
+.codemaker/codemap/
+.codemaker/codeindex/
+.codemaker/rules/codemap.mdc
+.codemaker/mcps.json
+.codemaker/hooks.json
+.claude/skills/codemap-*/
+.claude/skills/code-index-*/
+.claude/settings.local.json
+opencode.json
