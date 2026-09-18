@@ -11,7 +11,7 @@ import { Controller } from '../controller';
 import { AlignmentTracker } from '../prefs-align';
 import type { ConfigStore } from '../config';
 import type { HistoryStore } from '../history-db';
-import type { AppConfig } from '../config-migration';
+import type { AppConfig, AudioSourcePref } from '../config-migration';
 import { CONFIG_DEFAULTS } from '../config-migration';
 
 // ---------- 替身 ----------
@@ -278,6 +278,29 @@ describe('意图执行（client-gateway-state spec：单一动作源）', () => 
     h.gateway.close();
   });
 
+  it('setLlm：同值幂等；新值下发 change_llm 并持久化', () => {
+    const h = makeHarness();
+    h.controller.handle({ type: 'setLlm', modelId: 'hy-mt2-1.8b-q4km' }); // 默认值 → 幂等
+    expect(h.socket.sentJson().some((f) => f.action === 'change_llm')).toBe(false);
+
+    h.controller.handle({ type: 'setLlm', modelId: 'qwen3-1.7b-q4km' });
+    expect(h.socket.sentJson()).toContainEqual({
+      type: 'control', action: 'change_llm', model_id: 'qwen3-1.7b-q4km'
+    });
+    expect((h.config.get('translation') as { model: string }).model).toBe('qwen3-1.7b-q4km');
+    h.gateway.close();
+  });
+
+  it('setLlm：空 modelId 拒绝（仅错误 toast，无 WS 帧）', () => {
+    const h = makeHarness();
+    h.controller.handle({ type: 'setLlm', modelId: '' });
+    expect(h.socket.sentJson().some((f) => f.action === 'change_llm')).toBe(false);
+    const errors = (h.broadcasts.filter((b) => b.channel === 'app:toast') as
+      Array<{ payload: { kind: string } }>).filter((t) => t.payload.kind === 'error');
+    expect(errors.length).toBe(1);
+    h.gateway.close();
+  });
+
   it('toggleLock / toggleOverlay：状态迁移 + locked 持久化', () => {
     const h = makeHarness();
     h.controller.handle({ type: 'toggleLock' });
@@ -288,16 +311,49 @@ describe('意图执行（client-gateway-state spec：单一动作源）', () => 
     h.gateway.close();
   });
 
-  it('setAudioSource：同值幂等跳过，新值三处同步', () => {
+  it('setAudioSource：同值幂等跳过，新值三处同步（结构化设备源）', () => {
     const h = makeHarness();
-    h.controller.handle({ type: 'setAudioSource', id: '' });
+    h.controller.handle({ type: 'setAudioSource', source: { kind: 'device', id: '' } });
     expect(h.socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
-    h.controller.handle({ type: 'setAudioSource', id: 'dev-1' });
+    h.controller.handle({ type: 'setAudioSource', source: { kind: 'device', id: 'dev-1' } });
     expect(h.socket.sentJson()).toContainEqual({
-      type: 'control', action: 'set_audio_source', source_id: 'dev-1'
+      type: 'control', action: 'set_audio_source', source: { kind: 'device', id: 'dev-1' }
     });
     expect(h.state.getState().audioSource).toBe('dev-1');
-    expect((h.config.get('audio') as { sourceId: string }).sourceId).toBe('dev-1');
+    expect((h.config.get('audio') as { source: AudioSourcePref }).source)
+      .toEqual({ kind: 'device', id: 'dev-1' });
+    h.gateway.close();
+  });
+
+  it('setAudioSource：进程源 state 显示进程名、store 保存结构化源（pid→lastPid）', () => {
+    const h = makeHarness();
+    h.controller.handle({
+      type: 'setAudioSource', source: { kind: 'process', pid: 123, name: 'chrome.exe' }
+    });
+    expect(h.socket.sentJson()).toContainEqual({
+      type: 'control', action: 'set_audio_source',
+      source: { kind: 'process', pid: 123, name: 'chrome.exe' }
+    });
+    expect(h.state.getState().audioSource).toBe('chrome.exe');
+    expect((h.config.get('audio') as { source: AudioSourcePref }).source)
+      .toEqual({ kind: 'process', name: 'chrome.exe', lastPid: 123 });
+    h.gateway.close();
+  });
+
+  it('setAudioSource：同名不同实例（PID 不同）不被同值跳过', () => {
+    const h = makeHarness();
+    h.config.set('audio', {
+      source: { kind: 'process', name: 'chrome.exe', lastPid: 123 }
+    } as AppConfig['audio']);
+    h.controller.handle({
+      type: 'setAudioSource', source: { kind: 'process', pid: 456, name: 'chrome.exe' }
+    });
+    expect(h.socket.sentJson()).toContainEqual({
+      type: 'control', action: 'set_audio_source',
+      source: { kind: 'process', pid: 456, name: 'chrome.exe' }
+    });
+    expect((h.config.get('audio') as { source: AudioSourcePref }).source)
+      .toEqual({ kind: 'process', name: 'chrome.exe', lastPid: 456 });
     h.gateway.close();
   });
 
@@ -334,13 +390,67 @@ describe('乐观回退（settings-management spec：失败回退原值）', () =
     h.gateway.close();
   });
 
-  it('invalid_audio_source 回执 → 音频源回退', () => {
+  it('invalid_audio_source 回执（用户切换）→ 音频源回退原值', () => {
     const h = makeHarness();
-    h.controller.handle({ type: 'setAudioSource', id: 'dev-x' });
+    h.controller.handle({ type: 'setAudioSource', source: { kind: 'device', id: 'dev-x' } });
     expect(h.state.getState().audioSource).toBe('dev-x');
     h.socket.emit({ type: 'error', code: 'invalid_audio_source', message: 'bad' });
     expect(h.state.getState().audioSource).toBe('');
-    expect((h.config.get('audio') as { sourceId: string }).sourceId).toBe('');
+    expect((h.config.get('audio') as { source: AudioSourcePref }).source)
+      .toEqual({ kind: 'device', id: '' });
+    h.gateway.close();
+  });
+
+  it('翻译模型失败回执（下载失败）→ store 回退原值 + 错误 toast', () => {
+    const h = makeHarness();
+    h.controller.handle({ type: 'setLlm', modelId: 'qwen3-1.7b-q4km' });
+    expect((h.config.get('translation') as { model: string }).model).toBe('qwen3-1.7b-q4km');
+
+    h.socket.emit({ type: 'error', code: 'model_download_failed', message: 'net down' });
+
+    expect((h.config.get('translation') as { model: string }).model).toBe('hy-mt2-1.8b-q4km');
+    const errors = (h.broadcasts.filter((b) => b.channel === 'app:toast') as
+      Array<{ payload: { kind: string; text: string } }>).filter((t) => t.payload.kind === 'error');
+    expect(errors.some((t) => t.payload.text.includes('net down'))).toBe(true);
+    h.gateway.close();
+  });
+
+  it('翻译模型非法回执（invalid_llm / llm_load_failed）→ 同样回退', () => {
+    const h = makeHarness();
+    h.controller.handle({ type: 'setLlm', modelId: 'ghost-model' });
+    h.socket.emit({ type: 'error', code: 'invalid_llm', message: 'nope' });
+    expect((h.config.get('translation') as { model: string }).model).toBe('hy-mt2-1.8b-q4km');
+
+    h.controller.handle({ type: 'setLlm', modelId: 'hy-mt2-7b-q4km' });
+    h.socket.emit({ type: 'error', code: 'llm_load_failed', message: 'spawn failed' });
+    expect((h.config.get('translation') as { model: string }).model).toBe('hy-mt2-1.8b-q4km');
+    h.gateway.close();
+  });
+
+  it('invalid_audio_source 回执（对齐路径）→ 粘性重置默认设备 + 单条 warn toast', async () => {
+    const h = makeHarness();
+    // store 记录进程源 → 对齐下发 → 后端拒绝（无用户乐观锚点）
+    h.config.set('audio', {
+      source: { kind: 'process', name: 'chrome.exe', lastPid: 999 }
+    } as AppConfig['audio']);
+    const p = h.controller.align();
+    const req = h.socket.sentJson().filter((f) => f.type === 'request').pop();
+    h.socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    await p;
+    expect(h.socket.sentJson()).toContainEqual({
+      type: 'control', action: 'set_audio_source',
+      source: { kind: 'process', pid: 999, name: 'chrome.exe' }
+    });
+
+    h.socket.emit({ type: 'error', code: 'invalid_audio_source', message: '应用未运行' });
+    expect(h.state.getState().audioSource).toBe('');
+    expect((h.config.get('audio') as { source: AudioSourcePref }).source)
+      .toEqual({ kind: 'device', id: '' });
+    const audioToasts = (h.broadcasts.filter((b) => b.channel === 'app:toast') as
+      Array<{ payload: { kind: string; text: string } }>)
+      .filter((t) => t.payload.text.includes('音频源不可用'));
+    expect(audioToasts.length).toBe(1);
+    expect(audioToasts[0].payload.kind).toBe('warn');
     h.gateway.close();
   });
 
@@ -379,6 +489,50 @@ describe('其它广播路由', () => {
     h.gateway.close();
   });
 
+  it('pipeline_warning 新 reason 透传字段（stalled/engine_degraded，含 pending/detail）', () => {
+    const h = makeHarness();
+    h.socket.emit({
+      type: 'pipeline_warning',
+      reason: 'stalled',
+      dropped: 5,
+      pending: 3,
+      message: '识别引擎停滞，正在自动恢复…',
+      detail: { engine: 'asr' }
+    });
+    expect(h.state.getState().lastWarning).toMatchObject({
+      droppedTotal: 5,
+      reason: 'stalled',
+      pending: 3,
+      message: '识别引擎停滞，正在自动恢复…',
+      detail: { engine: 'asr' }
+    });
+
+    h.socket.emit({
+      type: 'pipeline_warning',
+      reason: 'engine_degraded',
+      dropped: 5,
+      message: '当前模型在 CPU 上难以实时，建议切换到 base/small',
+      detail: { engine: 'asr', from: 'cuda', to: 'cpu', device_reason: 'runtime_failed' }
+    });
+    const w = h.state.getState().lastWarning;
+    expect(w?.reason).toBe('engine_degraded');
+    expect(w?.detail).toEqual({
+      engine: 'asr', from: 'cuda', to: 'cpu', device_reason: 'runtime_failed'
+    });
+    h.gateway.close();
+  });
+
+  it('pipeline_warning 未知 reason / 缺 dropped：防御性容错不抛错', () => {
+    const h = makeHarness();
+    expect(() => h.socket.emit({
+      type: 'pipeline_warning', reason: 'future_reason', message: 'x'
+    })).not.toThrow();
+    const w = h.state.getState().lastWarning;
+    expect(w?.reason).toBe('future_reason');
+    expect(w?.droppedTotal).toBe(1);
+    h.gateway.close();
+  });
+
   it('vad_state 合法值迁移，非法值忽略；未知广播类型安全', () => {
     const h = makeHarness();
     h.socket.emit({ type: 'vad_state', state: 'speech' });
@@ -386,6 +540,26 @@ describe('其它广播路由', () => {
     h.socket.emit({ type: 'vad_state', state: 'bogus' });
     expect(h.state.getState().vad).toBe('speech');
     expect(() => h.socket.emit({ type: 'future_type', x: 1 })).not.toThrow();
+    h.gateway.close();
+  });
+
+  it('audio_source_lost → warn toast + store/state 粘性回默认设备（D6）', () => {
+    const h = makeHarness();
+    h.config.set('audio', {
+      source: { kind: 'process', name: 'chrome.exe', lastPid: 42 }
+    } as AppConfig['audio']);
+    h.controller.handle({ type: 'setAudioSource', source: { kind: 'process', pid: 42, name: 'chrome.exe' } });
+    h.socket.emit({ type: 'audio_source_lost', name: 'chrome.exe', pid: 42, fallback: 'system' });
+
+    expect(h.state.getState().audioSource).toBe('');
+    expect((h.config.get('audio') as { source: AudioSourcePref }).source)
+      .toEqual({ kind: 'device', id: '' });
+    const toasts = h.broadcasts.filter((b) => b.channel === 'app:toast') as
+      Array<{ payload: { kind: string; text: string } }>;
+    const lost = toasts.filter((t) => t.payload.text.includes('chrome.exe'));
+    expect(lost.length).toBe(1);
+    expect(lost[0].payload.kind).toBe('warn');
+    expect(lost[0].payload.text).toContain('已切换为整个系统');
     h.gateway.close();
   });
 });
@@ -430,6 +604,22 @@ describe('推理设备（add-inference-device-toggle D9）', () => {
     });
     // 静默降级：select 保持用户选择，不视为失败
     expect((h.config.get('inference') as { device: string }).device).toBe('cuda');
+    expect(h.broadcasts.filter((b) => b.channel === 'app:toast').length).toBe(toastsBefore);
+    h.gateway.close();
+  });
+
+  it('device_state reason=runtime_failed → 更新设备视图（运行期降级，无错误 toast）', () => {
+    const h = makeHarness();
+    const toastsBefore = h.broadcasts.filter((b) => b.channel === 'app:toast').length;
+    h.socket.emit({
+      type: 'device_state',
+      asr: { resolved: 'cpu', reason: 'runtime_failed' },
+      translation: { resolved: 'cpu', reason: 'no_cuda' }
+    });
+    expect(h.state.getState().device).toEqual({
+      asr: { resolved: 'cpu', reason: 'runtime_failed' },
+      translation: { resolved: 'cpu', reason: 'no_cuda' }
+    });
     expect(h.broadcasts.filter((b) => b.channel === 'app:toast').length).toBe(toastsBefore);
     h.gateway.close();
   });

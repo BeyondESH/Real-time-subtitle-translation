@@ -12,6 +12,10 @@
  * 缓存模式（至少证明打包二进制完整可服务）。
  *
  * 副作用：仅临时目录 + 独立端口 19001；成功即清理，失败保留证据目录。
+ *
+ * 注（replace-translation-engine-with-llamacpp）：首启除 Whisper 外，后端会以后台任务
+ * 预载默认翻译模型（Hy-MT2-1.8B，约 1.1GB，经 model_progress 可见）；本探针仅等待
+ * ASR initialized（翻译下载不阻塞服务启动），并顺带断言 get_config 的翻译段新形状。
  */
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -28,6 +32,8 @@ const WS_URL = `ws://localhost:${PORT}`;
 
 const results = [];
 let exitCode = 0;
+// --phase-b：Phase A 成功后仍强制继续 Phase B（验证打包 llama-server 就绪与设备上报）
+const FORCE_B = process.argv.includes('--phase-b');
 const check = (name, ok, extra) => {
   results.push(`${ok ? 'PASS' : 'FAIL'} | ${name}${extra ? ` (${extra})` : ''}`);
   if (!ok) exitCode = 1;
@@ -54,12 +60,12 @@ const CONFIG_YAML = [
   '  device: cpu',
   '  compute_type: int8',
   'translation:',
-  '  primary_model: Helsinki-NLP/opus-mt-ja-zh',
-  '  fallback_model: facebook/nllb-200-distilled-600M',
+  '  default_model: hy-mt2-1.8b-q4km',
+  '  download:',
+  '    source: auto',
   '  target_languages:',
   '    - zh',
-  '  lazy_load: true',
-  '  preload_primary: false',
+  '  device: auto',
   'websocket:',
   '  host: localhost',
   `  port: ${PORT}`,
@@ -92,19 +98,51 @@ function requestOnce(method, id, timeoutMs = 8000) {
 }
 
 /** 轮询 get_config 直到 asr.initialized=true；期间旁听 model_progress */
-async function waitInitialized(timeoutMs, progressSink) {
+async function waitInitialized(timeoutMs) {
   const t0 = Date.now();
   let seq = 0;
   while (Date.now() - t0 < timeoutMs) {
     try {
       const resp = await requestOnce('get_config', ++seq);
       if (resp && resp.ok && resp.result && resp.result.asr) {
-        if (resp.result.asr.initialized === true) return resp.result.asr;
+        if (resp.result.asr.initialized === true) return resp.result;
       }
     } catch { /* 初始化中/端口未就绪，重试 */ }
     await sleep(2500);
   }
   return null;
+}
+
+/** 翻译段新形状断言（replace-translation-engine-with-llamacpp：注册表 + 实际设备） */
+function checkTranslationShape(result, phase) {
+  const tr = (result && result.translation) || {};
+  check(`${phase}：translation 段为注册表新形状（model/available_models/resolved_device）`,
+    tr.model === 'hy-mt2-1.8b-q4km'
+      && Array.isArray(tr.available_models)
+      && Object.prototype.hasOwnProperty.call(tr, 'resolved_device')
+      && Object.prototype.hasOwnProperty.call(tr, 'device_reason'),
+    `model=${tr.model}`);
+  check(`${phase}：无 NLLB 旧字段`,
+    !('primary_model' in tr) && !('fallback_model' in tr)
+      && !('nllb_loaded' in tr) && !('nllb_languages' in tr));
+}
+
+/** 轮询至翻译 llama-server 就绪（ready=true），返回最终 result */
+async function waitTranslationReady(timeoutMs) {
+  const t0 = Date.now();
+  let seq = 1000;
+  let last = null;
+  while (Date.now() - t0 < timeoutMs) {
+    try {
+      const resp = await requestOnce('get_config', ++seq);
+      if (resp && resp.ok && resp.result && resp.result.translation) {
+        last = resp.result;
+        if (resp.result.translation.ready === true) return last;
+      }
+    } catch { /* 重试 */ }
+    await sleep(2500);
+  }
+  return last;
 }
 
 async function runPhase(label, envOverride, initTimeoutMs) {
@@ -120,6 +158,8 @@ async function runPhase(label, envOverride, initTimeoutMs) {
       ...process.env,
       SUBTITLE_CONFIG_PATH: cfgPath,
       SUBTITLE_LOG_DIR: logDir,
+      // 生产由 Electron BackendManager 注入；探针直连 exe 时按 extraResources 结构补位
+      SUBTITLE_LLAMA_DIR: path.resolve(path.dirname(EXE), '..', '..', 'llama'),
       ...envOverride(tmp)
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -137,15 +177,15 @@ async function runPhase(label, envOverride, initTimeoutMs) {
   };
 
   try {
-    const asr = await waitInitialized(initTimeoutMs);
+    const result = await waitInitialized(initTimeoutMs);
     const backendLogPath = path.join(logDir, 'backend.log');
     const backendLog = fs.existsSync(backendLogPath)
       ? fs.readFileSync(backendLogPath, 'utf8')
       : '';
-    return { tmp, asr, exited, stderrTail, backendLog, killTree };
+    return { tmp, result, exited, stderrTail, backendLog, killTree };
   } catch (err) {
     killTree();
-    return { tmp, asr: null, exited, stderrTail: `${stderrTail}\n${String(err)}`, backendLog: '', killTree };
+    return { tmp, result: null, exited, stderrTail: `${stderrTail}\n${String(err)}`, backendLog: '', killTree };
   }
 }
 
@@ -176,9 +216,10 @@ async function main() {
     TMP: tmp
   }), 240000);
 
-  if (A.asr) {
+  if (A.result) {
     check('PhaseA 首下载：get_config initialized=true（tiny/cpu/int8）',
-      A.asr.model_size === 'tiny', JSON.stringify(A.asr));
+      A.result.asr.model_size === 'tiny', JSON.stringify(A.result.asr));
+    checkTranslationShape(A.result, 'PhaseA');
     const cacheDir = path.join(A.tmp, '.cache', 'subtitle-translator', 'whisper');
     const nFiles = countFiles(cacheDir);
     check('PhaseA 首下载：重定向缓存目录出现真实模型文件', nFiles > 0, `${cacheDir} files=${nFiles}`);
@@ -186,23 +227,44 @@ async function main() {
     A.killTree();
     await sleep(1500);
     try { fs.rmSync(A.tmp, { recursive: true, force: true }); } catch { /* noop */ }
-    note('首下载路径已实证，跳过 Phase B');
-    return;
+    if (!FORCE_B) {
+      note('首下载路径已实证，跳过 Phase B');
+      return;
+    }
+    note('首下载路径已实证；--phase-b 强制继续 Phase B');
+  } else {
+    // ---------- Phase A 失败：留证据，降级 Phase B（缓存模式） ----------
+    note(`PhaseA 失败（多为网络不可达 HF）：exited=${A.exited} stderr尾部=${A.stderrTail.slice(-300)}`);
+    note(`PhaseA 证据保留: ${A.tmp}`);
+    A.killTree();
+    await sleep(1500);
   }
 
-  // ---------- Phase A 失败：留证据，降级 Phase B（缓存模式） ----------
-  note(`PhaseA 失败（多为网络不可达 HF）：exited=${A.exited} stderr尾部=${A.stderrTail.slice(-300)}`);
-  note(`PhaseA 证据保留: ${A.tmp}`);
-  A.killTree();
-  await sleep(1500);
-
-  const B = await runPhase('cached', () => ({}), 90000);
-  if (B.asr) {
+  const B = await runPhase('cached', () => ({ SUBTITLE_DEVICE: 'cuda' }), 90000);
+  if (B.result) {
     check('PhaseB 缓存模式：打包后端完整启动（模型加载+WS 服务）',
-      B.asr.model_size === 'tiny' && B.asr.initialized === true, JSON.stringify(B.asr));
-    check('PhaseB：backend.log 服务启动完成', B.backendLog.includes('服务启动完成'));
-    // 首下载路径无法在本环境自证（网络），如实降级为提示而非 PASS
-    note('首下载路径因网络未自证——保留给用户干净环境验收（5.6 ①）');
+      B.result.asr.model_size === 'tiny' && B.result.asr.initialized === true,
+      JSON.stringify(B.result.asr));
+    checkTranslationShape(B.result, 'PhaseB');
+    // 打包产物 llama-server 按设备拉起（SUBTITLE_DEVICE=cuda；无卡环境允许静默降级）
+    const ready = await waitTranslationReady(60000);
+    const tr = (ready && ready.translation) || {};
+    check('PhaseB：打包 llama-server 就绪（translation.ready=true）', tr.ready === true,
+      `resolved=${tr.resolved_device}/${tr.device_reason}`);
+    check('PhaseB：实际设备已上报（非空，允许静默降级）',
+      tr.resolved_device === 'cuda' || tr.resolved_device === 'cpu',
+      `resolved=${tr.resolved_device}/${tr.device_reason}`);
+    // 日志在翻译就绪后重读（runPhase 的快照早于 llama-server 启动）
+    const logNow = (() => {
+      const p = path.join(B.tmp, 'logs', 'backend.log');
+      return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
+    })();
+    check('PhaseB：backend.log 可见 llama-server 就绪', logNow.includes('llama-server 就绪'));
+    check('PhaseB：backend.log 服务启动完成', logNow.includes('服务启动完成'));
+    if (!A.result) {
+      // 首下载路径无法在本环境自证（网络），如实降级为提示而非 PASS
+      note('首下载路径因网络未自证——保留给用户干净环境验收（5.6 ①）');
+    }
   } else {
     check('PhaseB 缓存模式：打包后端完整启动', false,
       `exited=${B.exited} stderr尾部=${B.stderrTail.slice(-400)}`);
@@ -210,7 +272,7 @@ async function main() {
   }
   B.killTree();
   await sleep(1500);
-  if (B.asr) {
+  if (B.result) {
     try { fs.rmSync(B.tmp, { recursive: true, force: true }); } catch { /* noop */ }
   }
 }

@@ -171,7 +171,9 @@ class WebSocketServer:
         message = json.dumps(data, ensure_ascii=False)
         disconnected = set()
 
-        for client in self._clients:
+        # 遍历快照：发送期间客户端可能断开（_clients 被并发修改），
+        # 直接迭代原集合会抛 "Set changed size during iteration"
+        for client in list(self._clients):
             try:
                 await client.send(message)
             except websockets.exceptions.ConnectionClosed:

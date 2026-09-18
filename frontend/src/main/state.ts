@@ -19,6 +19,14 @@ export interface WarningInfo {
   droppedTotal: number;
   /** 最近一次告警的本地时间戳（ms） */
   at: number;
+  /** 告警原因（D5：queue_full/stalled/engine_degraded，未知值原样透传） */
+  reason?: string;
+  /** 后端告警文案（如 engine_degraded 的降级说明） */
+  message?: string;
+  /** 停滞时队列深度（可选） */
+  pending?: number;
+  /** 结构化补充信息（可选） */
+  detail?: Record<string, unknown>;
 }
 
 export interface AppState {
@@ -29,7 +37,11 @@ export interface AppState {
   modelDownload: ModelDownload | null;
   activeLanguage: string;
   targetLanguages: string[];
-  audioSource: string; // '' = 默认设备
+  /**
+   * 当前音频源的显示层标识：设备源=设备 id（'' = 整个系统/默认设备），
+   * 进程源=进程名。退出回退（audio_source_lost）与对齐失败重置均归约到 ''。
+   */
+  audioSource: string;
   locked: boolean;
   overlayVisible: boolean;
   lastWarning: WarningInfo | null;
@@ -49,10 +61,11 @@ export type AppAction =
   | { type: 'modelDownloadDone' }
   | { type: 'languageChanged'; activeLanguage: string }
   | { type: 'targetLanguagesChanged'; targetLanguages: string[] }
+  /** 音频源显示标识变更；进程退出/对齐失败的粘性回退统一置 ''（默认设备） */
   | { type: 'audioSourceChanged'; audioSource: string }
   | { type: 'lockToggled'; locked?: boolean }
   | { type: 'overlayVisibilityChanged'; visible: boolean }
-  | { type: 'pipelineWarning'; droppedTotal?: number; at?: number }
+  | { type: 'pipelineWarning'; droppedTotal?: number; at?: number; reason?: string; message?: string; pending?: number; detail?: Record<string, unknown> }
   | { type: 'deviceChanged'; device: DeviceStateView | null }
   | { type: 'activeSessionChanged'; id: string | null }
   | { type: 'configApplied'; patch: Partial<AppState> };
@@ -177,7 +190,18 @@ export function reduce(state: AppState, action: AppAction): AppState {
         ? action.droppedTotal
         : state.droppedCount + 1;
       const at = action.at ?? Date.now();
-      return { ...state, droppedCount, lastWarning: { droppedTotal: droppedCount, at } };
+      return {
+        ...state,
+        droppedCount,
+        lastWarning: {
+          droppedTotal: droppedCount,
+          at,
+          reason: action.reason,
+          message: action.message,
+          pending: action.pending,
+          detail: action.detail
+        }
+      };
     }
 
     case 'activeSessionChanged':

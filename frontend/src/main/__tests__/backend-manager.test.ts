@@ -96,14 +96,20 @@ describe('BackendManager 生命周期', () => {
   beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bmm-')); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); vi.restoreAllMocks(); });
 
-  function makeManager(getDevice: () => 'auto' | 'cpu' | 'cuda' = () => 'auto') {
+  function makeManager(
+    getDevice: () => 'auto' | 'cpu' | 'cuda' = () => 'auto', packaged = false
+  ) {
     fs.mkdirSync(path.join(tmpDir, 'repo'), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'repo', 'config.yaml'), 'audio: {}', 'utf8');
+    if (packaged) {
+      fs.mkdirSync(path.join(tmpDir, 'resources'), { recursive: true });
+      fs.writeFileSync(path.join(tmpDir, 'resources', 'config.yaml'), 'audio: {}', 'utf8');
+    }
     const calls: Array<{ cmd: string; args: string[]; env: NodeJS.ProcessEnv; cwd?: string }> = [];
     const child = new FakeChild();
     const exits: Array<number | null> = [];
     const mgr = new BackendManager(
-      fakePaths(tmpDir), { host: 'localhost', port: 8765 }, silentLogger,
+      fakePaths(tmpDir, packaged), { host: 'localhost', port: 8765 }, silentLogger,
       { onExit: (code) => exits.push(code) },
       {
         spawnFn: (cmd, args, opts) => {
@@ -125,6 +131,23 @@ describe('BackendManager 生命周期', () => {
     expect(calls[0].env.SUBTITLE_LOG_DIR).toBe(path.join(tmpDir, 'userData', 'logs'));
     expect(calls[0].env.SUBTITLE_CONFIG_PATH).toBe(path.join(tmpDir, 'userData', 'config.yaml'));
     expect(fs.existsSync(calls[0].env.SUBTITLE_CONFIG_PATH!)).toBe(true); // 副本已生成
+  });
+
+  it('dev 模式 SUBTITLE_LLAMA_DIR 指向 repo vendor 目录', () => {
+    const { mgr, calls } = makeManager();
+    mgr.start();
+    expect(calls[0].env.SUBTITLE_LLAMA_DIR).toBe(
+      path.join(tmpDir, 'repo', 'backend', 'vendor', 'llama')
+    );
+  });
+
+  it('打包模式 SUBTITLE_LLAMA_DIR 指向 resources/llama', () => {
+    const { mgr, calls } = makeManager(() => 'auto', true);
+    mgr.start();
+    expect(calls[0].cmd.endsWith('SubtitleTranslator.exe')).toBe(true);
+    expect(calls[0].env.SUBTITLE_LLAMA_DIR).toBe(
+      path.join(tmpDir, 'resources', 'llama')
+    );
   });
 
   it('推理设备 auto：不注入 SUBTITLE_DEVICE', () => {

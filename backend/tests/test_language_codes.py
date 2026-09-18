@@ -1,17 +1,12 @@
 """
-语言代码规范化与翻译语言对映射测试
+语言代码规范化与翻译提示词语言名映射测试
 """
-from unittest.mock import AsyncMock
-
-import pytest
-
 from language_codes import (
-    NLLB_LANGUAGE_MAP,
+    PROMPT_LANGUAGE_NAMES,
     normalize_lang,
-    to_nllb_code,
+    to_prompt_language_name,
     unsupported_pair_message,
 )
-from translator import Translator
 
 
 class TestNormalizeLang:
@@ -33,86 +28,23 @@ class TestNormalizeLang:
         assert normalize_lang('  ') == ''
 
 
-class TestNllbMapping:
+class TestPromptLanguageNames:
     def test_mapped_languages(self):
-        assert to_nllb_code('zh') == 'zho_Hans'
-        assert to_nllb_code('zh-cn') == 'zho_Hans'  # 变体先归一
-        assert to_nllb_code('ja') == 'jpn_Jpan'
-        assert to_nllb_code('en') == 'eng_Latn'
+        assert to_prompt_language_name('zh') == '简体中文'
+        assert to_prompt_language_name('zh-cn') == '简体中文'  # 变体先归一
+        assert to_prompt_language_name('ja') == '日语'
+        assert to_prompt_language_name('en') == '英语'
 
     def test_unmapped_returns_none(self):
-        assert to_nllb_code('xx') is None
-        assert to_nllb_code('') is None
+        assert to_prompt_language_name('xx') is None
+        assert to_prompt_language_name('') is None
 
-    def test_no_fabricated_codes(self):
-        """绝不拼接语言代码（回归 zh-cn_Latn bug）"""
-        for lang in NLLB_LANGUAGE_MAP:
-            code = to_nllb_code(lang)
-            assert '_' in code and code.split('_')[0].isalpha()
-        assert to_nllb_code('zh-cn') != 'zh-cn_Latn'
+    def test_mapping_is_explicit_lookup_only(self):
+        """映射表为显式查表：显示名非空且不等于语言代码本身（回归动态拼接）"""
+        for code, name in PROMPT_LANGUAGE_NAMES.items():
+            assert isinstance(name, str) and name
+            assert name != code
 
     def test_unsupported_pair_message(self):
         msg = unsupported_pair_message('xx', 'zh')
         assert 'xx' in msg and 'zh' in msg
-
-
-def make_translator():
-    config = {
-        'translation': {
-            'primary_model': 'Helsinki-NLP/opus-mt-ja-zh',
-            'fallback_model': 'facebook/nllb-200-distilled-600M',
-            'target_languages': ['zh', 'en'],
-            'device': 'cpu',
-            'lazy_load': True,
-            'preload_primary': False,
-        }
-    }
-    t = Translator(config)
-    t._initialized = True
-    return t
-
-
-class TestTranslatorRouting:
-    async def test_same_language_skipped(self):
-        """源语言与目标语言相同 → 跳过该语言对"""
-        t = make_translator()
-        t.ensure_nllb = AsyncMock()
-        t._translate_with_nllb = AsyncMock(return_value='hello')
-
-        results = await t.translate('你好世界', 'zh-cn')  # 变体归一为 zh
-        assert set(results.keys()) == {'en'}
-        assert results['en'] == 'hello'
-
-    async def test_unsupported_pair_placeholder(self):
-        """未映射语言对返回占位串，不触发模型加载"""
-        t = make_translator()
-        t.ensure_nllb = AsyncMock()
-
-        results = await t.translate('text', source_language='xx')
-        # en 目标可映射，但源语言 xx 未映射 → 占位
-        assert '未支持的语言对' in results['en']
-        t.ensure_nllb.assert_not_called()
-
-    async def test_ja_zh_uses_primary(self):
-        """日→中走主模型，不触碰 NLLB"""
-        t = make_translator()
-        t.target_languages = ['zh']  # 只留日中语言对
-        t.ensure_primary = AsyncMock()
-        t.ensure_nllb = AsyncMock()
-        t._translate_with_primary = AsyncMock(return_value='你好')
-
-        results = await t.translate('こんにちは', 'ja')
-        assert results['zh'] == '你好'
-        t.ensure_primary.assert_called_once()
-        t.ensure_nllb.assert_not_called()
-
-    async def test_missing_source_language(self):
-        """缺少源语言（应来自 ASR）→ 返回空并告警"""
-        t = make_translator()
-        results = await t.translate('text', None)
-        assert results == {}
-
-    async def test_empty_text(self):
-        t = make_translator()
-        assert await t.translate('', 'ja') == {}
-        assert await t.translate('   ', 'ja') == {}

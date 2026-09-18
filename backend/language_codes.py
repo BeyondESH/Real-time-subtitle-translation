@@ -1,9 +1,9 @@
 """
-语言代码规范化与翻译模型语言映射
+语言代码规范化与翻译提示词语言名映射
 
 管线中的源语言以 faster-whisper 的识别结果为唯一依据（ISO 639-1），
-本模块提供规范化纯函数与 NLLB 显式映射表。未映射语言对安全降级，
-绝不动态拼接语言代码。
+本模块提供规范化纯函数与「ISO 码 → prompt 语言显示名」显式映射表。
+未映射语言对安全降级，绝不动态拼接语言名或语言代码。
 """
 import logging
 from typing import Dict, Optional
@@ -21,18 +21,30 @@ _NORMALIZE_MAP: Dict[str, str] = {
     'zh-sg': 'zh',
 }
 
-# NLLB-200 显式语言代码映射（ISO 639-1 -> NLLB 代码）
-NLLB_LANGUAGE_MAP: Dict[str, str] = {
-    'zh': 'zho_Hans',  # 中文（简体）
-    'ja': 'jpn_Jpan',  # 日语
-    'en': 'eng_Latn',  # 英语
-    'ko': 'kor_Hang',  # 韩语
-    'fr': 'fra_Latn',  # 法语
-    'de': 'deu_Latn',  # 德语
-    'es': 'spa_Latn',  # 西班牙语
-    'ru': 'rus_Cyrl',  # 俄语
-    'pt': 'por_Latn',  # 葡萄牙语
-    'it': 'ita_Latn',  # 意大利语
+# 语言显示名映射（ISO 639-1 -> 提示词中的目标语言名，用于翻译指令注入）
+PROMPT_LANGUAGE_NAMES: Dict[str, str] = {
+    'zh': '简体中文',
+    'ja': '日语',
+    'en': '英语',
+    'ko': '韩语',
+    'fr': '法语',
+    'de': '德语',
+    'es': '西班牙语',
+    'ru': '俄语',
+    'pt': '葡萄牙语',
+    'it': '意大利语',
+    'ar': '阿拉伯语',
+    'th': '泰语',
+    'vi': '越南语',
+    'id': '印度尼西亚语',
+    'hi': '印地语',
+    'tr': '土耳其语',
+    'nl': '荷兰语',
+    'pl': '波兰语',
+    'sv': '瑞典语',
+    'uk': '乌克兰语',
+    'ms': '马来语',
+    'tl': '菲律宾语',
 }
 
 
@@ -55,21 +67,21 @@ def normalize_lang(code: Optional[str]) -> str:
     return _NORMALIZE_MAP.get(normalized, normalized)
 
 
-def to_nllb_code(lang: str) -> Optional[str]:
+def to_prompt_language_name(lang: str) -> Optional[str]:
     """
-    转换为 NLLB 语言代码。仅查显式映射表，不做任何拼接。
+    转换为提示词语言显示名。仅查显式映射表，不做任何拼接。
 
     Args:
         lang: 规范化前的语言代码（内部会先 normalize）
 
     Returns:
-        NLLB 语言代码；未映射时返回 None
+        语言显示名（如 '简体中文'）；未映射时返回 None
     """
     normalized = normalize_lang(lang)
-    code = NLLB_LANGUAGE_MAP.get(normalized)
-    if code is None:
-        logger.warning(f"NLLB 未支持的语言代码: {lang}")
-    return code
+    name = PROMPT_LANGUAGE_NAMES.get(normalized)
+    if name is None:
+        logger.warning(f"未支持的目标语言代码: {lang}")
+    return name
 
 
 def unsupported_pair_message(source_lang: str, target_lang: str) -> str:

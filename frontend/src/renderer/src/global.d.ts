@@ -5,12 +5,22 @@
 
 interface DeviceEngineStateView {
   resolved: 'cuda' | 'cpu' | null;
-  reason: 'auto' | 'user' | 'no_cuda' | 'load_failed';
+  reason: 'auto' | 'user' | 'no_cuda' | 'load_failed' | 'runtime_failed';
 }
 
 interface DeviceStateView {
   asr: DeviceEngineStateView;
   translation: DeviceEngineStateView;
+}
+
+/** 最近一次 pipeline_warning 视图（design D5；reason 开放，未知值需泛化呈现） */
+interface WarningInfoView {
+  droppedTotal: number;
+  at: number;
+  reason?: string;
+  message?: string;
+  pending?: number;
+  detail?: Record<string, unknown>;
 }
 
 interface AppStateView {
@@ -24,7 +34,7 @@ interface AppStateView {
   audioSource: string;
   locked: boolean;
   overlayVisible: boolean;
-  lastWarning: { droppedTotal: number; at: number } | null;
+  lastWarning: WarningInfoView | null;
   droppedCount: number;
   /** 后端上报的实际推理设备（null = 尚未上报/检测中） */
   device: DeviceStateView | null;
@@ -40,6 +50,11 @@ interface SubtitleStyleView {
   displayMode: 'translation_only' | 'original_and_translation';
   preset: 'text' | 'acrylic';
 }
+
+/** 音频源偏好（渲染边界本地声明，与主进程 AudioSourcePref 结构对齐） */
+type AudioSourcePrefView =
+  | { kind: 'device'; id: string }
+  | { kind: 'process'; name: string; lastPid: number | null };
 
 interface AppConfigView {
   window: {
@@ -66,11 +81,12 @@ interface AppConfigView {
     switchModel: boolean;
     toggleLock: boolean;
   };
-  translation: { targetLanguages: string[]; activeLanguage: string };
+  translation: { targetLanguages: string[]; activeLanguage: string; model: string };
   asr: { model: string };
   /** 推理设备偏好（auto/cpu/cuda） */
   inference: { device: 'auto' | 'cpu' | 'cuda' };
-  audio: { sourceId: string };
+  /** 音频源偏好（结构化：设备源或按进程源） */
+  audio: { source: AudioSourcePrefView };
   locked: boolean;
   theme: 'dark' | 'light' | 'system';
   system: { autoStart: boolean };

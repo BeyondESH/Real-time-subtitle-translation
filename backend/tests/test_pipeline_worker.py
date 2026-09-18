@@ -2,11 +2,13 @@
 PipelineWorker 背压与消费测试
 """
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
 
+from audio_buffer import UtteranceSegment
 from pipeline_worker import PipelineWorker
 
 
@@ -176,5 +178,142 @@ class TestTimestamps:
             assert msg['original'] == 'hi'
             assert msg['source_language'] == 'en'
             assert msg['translations'] == {'zh': '你好'}
+        finally:
+            await worker.stop()
+
+
+async def wait_until(cond, timeout=2.0):
+    """轮询等待条件成立"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+class TestStallSupervision:
+    """停滞监管与整句预算（fix-asr-runtime-stall）"""
+
+    async def test_stall_condition_inflight_within_budget_not_stalled(self):
+        """在途语句在预算内 = 慢而非停滞（慢而非死不误报）"""
+        worker, *_ = make_worker()
+        worker._queue = asyncio.Queue(maxsize=8)
+        worker._queue.put_nowait(UtteranceSegment(audio=audio()))
+        worker._inflight_segment = UtteranceSegment(audio=audio(1.0))
+        worker._inflight_started = time.monotonic()
+        worker._last_progress = time.monotonic() - 1000
+        assert worker._stall_deadline_exceeded() is False
+
+    async def test_stall_condition_idle_exceeds_threshold(self):
+        """无在途且超阈值无进度 = 停滞"""
+        worker, *_ = make_worker()
+        worker._queue = asyncio.Queue(maxsize=8)
+        worker._queue.put_nowait(UtteranceSegment(audio=audio()))
+        worker._inflight_segment = None
+        worker._inflight_started = None
+        worker._last_progress = time.monotonic() - 1000
+        assert worker._stall_deadline_exceeded() is True
+
+    async def test_stall_condition_empty_queue_not_stalled(self):
+        """无待处理不判停滞"""
+        worker, *_ = make_worker()
+        worker._queue = asyncio.Queue(maxsize=8)
+        worker._last_progress = time.monotonic() - 1000
+        assert worker._stall_deadline_exceeded() is False
+
+    async def test_handle_stall_purges_counts_warns_and_recovers(self):
+        """停滞处置：告警（检测）→ 清积压计数 → 健康回调 → 告警（恢复）"""
+        calls = []
+        worker, asr, translator, ws = make_worker(queue_size=4)
+        worker._on_stall = lambda: calls.append(1)
+        await worker.start()
+        try:
+            # 模拟消费者卡死：停掉消费任务
+            worker._task.cancel()
+            try:
+                await worker._task
+            except asyncio.CancelledError:
+                pass
+
+            for _ in range(3):
+                worker.submit(audio())
+
+            await worker._handle_stall()
+
+            assert worker.dropped_count == 3
+            assert worker.pending_count == 0
+            assert calls == [1]
+
+            warnings = [
+                c.args[0] for c in ws.send.call_args_list
+                if c.args[0].get('type') == 'pipeline_warning'
+            ]
+            assert [w['reason'] for w in warnings] == ['stalled', 'stalled']
+            assert warnings[0]['pending'] == 3
+            assert '正在自动恢复' in warnings[0]['message']
+            assert '已清理积压 3 句' in warnings[1]['message']
+            assert all('dropped' in w for w in warnings)
+        finally:
+            await worker.stop()
+
+    async def test_segment_budget_timeout_drops_and_continues(self, monkeypatch):
+        """整句预算超时：丢弃该句并继续消费（活性兜底）"""
+        import pipeline_worker as pw
+        monkeypatch.setattr(pw, 'segment_budget_s', lambda segment: 0.05)
+
+        state = {'slow': True}
+        asr = AsyncMock()
+        asr.is_ready = True
+
+        async def transcribe(audio_data):
+            if state['slow']:
+                await asyncio.sleep(5)  # 超过预算 → wait_for 取消
+            return {'text': 'hi', 'language': 'en'}
+
+        asr.transcribe = transcribe
+        translator = AsyncMock()
+        translator.translate = AsyncMock(return_value={'zh': '好'})
+        ws = AsyncMock()
+        ws.send = AsyncMock()
+        worker = PipelineWorker(asr, translator, ws, queue_size=4)
+
+        await worker.start()
+        try:
+            worker.submit(audio())
+            assert await wait_until(lambda: worker.dropped_count >= 1)
+
+            state['slow'] = False
+            worker.submit(audio())
+            assert await wait_until(lambda: any(
+                c.args[0].get('type') == 'subtitle' for c in ws.send.call_args_list
+            ))
+        finally:
+            await worker.stop()
+
+    async def test_queue_full_warning_payload_shape(self):
+        """queue_full 告警保留既有字段与语义（旧客户端兼容）"""
+        worker, asr, translator, ws = make_worker(queue_size=1)
+        await worker.start()
+        try:
+            worker._task.cancel()
+            try:
+                await worker._task
+            except asyncio.CancelledError:
+                pass
+
+            assert worker.submit(audio()) is True
+            assert worker.submit(audio()) is False
+            assert await wait_until(lambda: any(
+                c.args[0].get('type') == 'pipeline_warning'
+                for c in ws.send.call_args_list
+            ))
+            warning = [
+                c.args[0] for c in ws.send.call_args_list
+                if c.args[0].get('type') == 'pipeline_warning'
+            ][-1]
+            assert warning['reason'] == 'queue_full'
+            assert warning['dropped'] == 1
+            assert 'message' in warning
         finally:
             await worker.stop()

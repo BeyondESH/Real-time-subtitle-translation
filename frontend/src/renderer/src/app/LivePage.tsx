@@ -161,7 +161,7 @@ export function LivePage() {
         </button>
       )}
 
-      {state && <StatusPillBar state={state} />}
+      {state && <StatusPillBar state={state} cfg={cfg} />}
       <ToastHost />
     </div>
   );

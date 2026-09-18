@@ -144,4 +144,4 @@ class TestConfigLoading:
         cfg = app._default_config()
         assert cfg['pipeline']['queue_size'] > 0
         assert cfg['vad']['min_silence_duration_ms'] > 0
-        assert cfg['translation']['lazy_load'] is True
+        assert cfg['translation']['default_model'] == 'hy-mt2-1.8b-q4km'

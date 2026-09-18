@@ -8,7 +8,7 @@
  */
 import Store from 'electron-store';
 import type { AppConfig, MigrationEntry } from './config-migration';
-import { CONFIG_DEFAULTS, runLegacyYamlMigration } from './config-migration';
+import { CONFIG_DEFAULTS, resolveAudioSection, runLegacyYamlMigration } from './config-migration';
 import type { BackendLogger } from './backend-manager';
 
 export type { AppConfig } from './config-migration';
@@ -30,6 +30,8 @@ export class ConfigStore {
       }
     });
     this.normalizeWindowSection();
+    this.normalizeAudioSection();
+    this.normalizeTranslationSection();
   }
 
   /**
@@ -45,6 +47,32 @@ export class ConfigStore {
         displayId: w.displayId ?? null,
         positions: w.positions ?? {}
       });
+    }
+  }
+
+  /**
+   * 旧用户 store 的 audio 段为裸字符串 `sourceId`——升级首启规范为结构化
+   * `audio.source`（幂等）。点路径写入保留旧键 `sourceId` 不删，此后不再读取
+   * （settings-management spec "音频源偏好迁移"）。
+   */
+  private normalizeAudioSection(): void {
+    const raw = this.store.get('audio') as unknown;
+    const normalized = resolveAudioSection(raw);
+    if (normalized.changed) {
+      (this.store.set as unknown as (key: string, value: unknown) => void)(
+        'audio.source', normalized.source
+      );
+    }
+  }
+
+  /**
+   * 旧用户 store 的 translation 段缺少后加键 `model`——electron-store defaults
+   * 不做嵌套合并，启动时一次性补齐（默认翻译模型；幂等）。
+   */
+  private normalizeTranslationSection(): void {
+    const t = this.store.get('translation') as Partial<AppConfig['translation']> | undefined;
+    if (t && t.model === undefined) {
+      this.store.set('translation', { ...CONFIG_DEFAULTS.translation, ...t });
     }
   }
 

@@ -52,10 +52,10 @@ function makeConfig(over: Partial<AppConfigView['onboarding']> = {}): AppConfigV
     shortcutStatus: {
       togglePause: true, switchLanguage: true, switchModel: true, toggleLock: true
     },
-    translation: { targetLanguages: ['zh', 'en'], activeLanguage: 'zh' },
+    translation: { targetLanguages: ['zh', 'en'], activeLanguage: 'zh', model: 'hy-mt2-1.8b-q4km' },
     asr: { model: 'base' },
     inference: { device: 'auto' },
-    audio: { sourceId: '' },
+    audio: { source: { kind: 'device', id: '' } },
     locked: true,
     theme: 'dark',
     system: { autoStart: false },

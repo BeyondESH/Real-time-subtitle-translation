@@ -50,7 +50,8 @@ const prefs = (over: Partial<PrefsSnapshot> = {}): PrefsSnapshot => ({
   targetLanguages: ['zh', 'en'],
   activeLanguage: 'zh',
   model: 'base',
-  audioSourceId: '',
+  translationModel: 'hy-mt2-1.8b-q4km',
+  audioSource: { kind: 'device', id: '' },
   device: 'auto',
   ...over
 });
@@ -92,7 +93,7 @@ describe('alignPreferences', () => {
     const warns: unknown[][] = [];
     const { gw, socket } = makeOpenGateway(warns);
     const tracker = new AlignmentTracker();
-    const p = alignPreferences(gw, prefs({ audioSourceId: 'dev-1' }), tracker, { ...silentLogger, warn: (...a: unknown[]) => { warns.push(a); } });
+    const p = alignPreferences(gw, prefs({ audioSource: { kind: 'device', id: 'dev-1' } }), tracker, { ...silentLogger, warn: (...a: unknown[]) => { warns.push(a); } });
     const req = socket.sentJson().find((f) => f.type === 'request');
     socket.emit({ type: 'response', id: req?.id, ok: false, error: 'boom' });
     await p;
@@ -103,9 +104,10 @@ describe('alignPreferences', () => {
   it('音频源会话级幂等：首次发送，重连不重复；后端重启后重发', async () => {
     const { gw, socket } = makeOpenGateway();
     const tracker = new AlignmentTracker();
+    const source = { kind: 'device' as const, id: 'dev-1' };
 
-    // 第一次连接（sourceId 非空）
-    let p = alignPreferences(gw, prefs({ audioSourceId: 'dev-1' }), tracker, silentLogger);
+    // 第一次连接（source 非空）
+    let p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
     let req = socket.sentJson().find((f) => f.type === 'request');
     socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
     await p;
@@ -113,7 +115,7 @@ describe('alignPreferences', () => {
 
     // 模拟 WS 重连（同后端会话）：清空已发帧再对齐 → 不再发送
     socket.sent.length = 0;
-    p = alignPreferences(gw, prefs({ audioSourceId: 'dev-1' }), tracker, silentLogger);
+    p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
     req = socket.sentJson().find((f) => f.type === 'request');
     socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
     await p;
@@ -122,19 +124,97 @@ describe('alignPreferences', () => {
     // 后端进程重启：tracker 复位后应重新应用
     tracker.markBackendRestarted();
     socket.sent.length = 0;
-    p = alignPreferences(gw, prefs({ audioSourceId: 'dev-1' }), tracker, silentLogger);
+    p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
     req = socket.sentJson().find((f) => f.type === 'request');
     socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
     await p;
     expect(socket.sentJson().filter((f) => f.action === 'set_audio_source').length).toBe(1);
   });
 
-  it('sourceId 为空（默认设备）时永不发送 set_audio_source', async () => {
+  it('source 为空（默认设备）时永不发送 set_audio_source', async () => {
     const { gw, socket } = makeOpenGateway();
-    const p = alignPreferences(gw, prefs({ audioSourceId: '' }), new AlignmentTracker(), silentLogger);
+    const p = alignPreferences(gw, prefs({ audioSource: { kind: 'device', id: '' } }), new AlignmentTracker(), silentLogger);
     const req = socket.sentJson().find((f) => f.type === 'request');
     socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
     await p;
+    expect(socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
+  });
+});
+
+describe('alignPreferences 音频源结构化对齐（D9）', () => {
+  async function run(over: Partial<PrefsSnapshot>, result: unknown) {
+    const { gw, socket } = makeOpenGateway();
+    const p = alignPreferences(gw, prefs(over), new AlignmentTracker(), silentLogger);
+    const req = socket.sentJson().find((f) => f.type === 'request');
+    socket.emit({ type: 'response', id: req?.id, ok: true, result });
+    await p;
+    return { socket };
+  }
+
+  const deviceFrame = (id: string): Record<string, unknown> => ({
+    type: 'control', action: 'set_audio_source', source: { kind: 'device', id }
+  });
+
+  it('后端回传同源（设备）→ 不发 set_audio_source', async () => {
+    const { socket } = await run(
+      { audioSource: { kind: 'device', id: 'dev-1' } },
+      { asr: { model_size: 'base' }, audio: { source: { kind: 'device', id: 'dev-1' } } }
+    );
+    expect(socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
+  });
+
+  it('后端回传不同源（设备）→ 下发 store 结构化源', async () => {
+    const { socket } = await run(
+      { audioSource: { kind: 'device', id: 'dev-2' } },
+      { asr: { model_size: 'base' }, audio: { source: { kind: 'device', id: 'dev-1' } } }
+    );
+    expect(socket.sentJson()).toContainEqual(deviceFrame('dev-2'));
+  });
+
+  it('store 为进程源且后端回传同进程 → 不发；不同进程 → 下发（含 lastPid→pid 映射）', async () => {
+    const skip = await run(
+      { audioSource: { kind: 'process', name: 'chrome.exe', lastPid: 12 } },
+      { asr: { model_size: 'base' }, audio: { source: { kind: 'process', name: 'chrome.exe', pid: 99 } } }
+    );
+    expect(skip.socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
+
+    const send = await run(
+      { audioSource: { kind: 'process', name: 'chrome.exe', lastPid: 12 } },
+      { asr: { model_size: 'base' }, audio: { source: { kind: 'device', id: '' } } }
+    );
+    expect(send.socket.sentJson()).toContainEqual({
+      type: 'control', action: 'set_audio_source',
+      source: { kind: 'process', pid: 12, name: 'chrome.exe' }
+    });
+  });
+
+  it('后端旧形状缺 audio.source → 走 tracker 幂等（非默认源发送一次，含 lastPid→pid 映射）', async () => {
+    const { gw, socket } = makeOpenGateway();
+    const tracker = new AlignmentTracker();
+    const source = { kind: 'process' as const, name: 'chrome.exe', lastPid: 12 };
+    let p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
+    let req = socket.sentJson().find((f) => f.type === 'request');
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    await p;
+    expect(socket.sentJson()).toContainEqual({
+      type: 'control', action: 'set_audio_source',
+      source: { kind: 'process', pid: 12, name: 'chrome.exe' }
+    });
+    expect(socket.sentJson().filter((f) => f.action === 'set_audio_source').length).toBe(1);
+
+    socket.sent.length = 0;
+    p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
+    req = socket.sentJson().find((f) => f.type === 'request');
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    await p;
+    expect(socket.sentJson().filter((f) => f.action === 'set_audio_source').length).toBe(0);
+  });
+
+  it('进程源缺 PID（脏数据）→ 跳过下发并记警告', async () => {
+    const { socket } = await run(
+      { audioSource: { kind: 'process', name: 'chrome.exe', lastPid: null } },
+      { asr: { model_size: 'base' } }
+    );
     expect(socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
   });
 });
@@ -184,8 +264,53 @@ describe('alignPreferences 设备对齐（add-inference-device-toggle D9）', ()
     });
   });
 
+  it('runtime_failed 原因经 get_config 透传（运行期降级至 CPU）', async () => {
+    const { view } = await run({ device: 'auto' }, CONFIG_WITH_DEVICE('auto', 'cpu', 'runtime_failed'));
+    expect(view).toEqual({
+      asr: { resolved: 'cpu', reason: 'runtime_failed' },
+      translation: { resolved: 'cpu', reason: 'runtime_failed' }
+    });
+  });
+
   it('旧后端 resolved 字段全缺 → 返回 null（保持检测态）', async () => {
     const { view } = await run({ device: 'auto' }, { asr: { model_size: 'base' }, translation: {} });
     expect(view).toBeNull();
+  });
+});
+
+describe('alignPreferences 翻译模型对齐（replace-translation-engine-with-llamacpp）', () => {
+  async function run(over: Partial<PrefsSnapshot>, result: unknown) {
+    const { gw, socket } = makeOpenGateway();
+    const p = alignPreferences(gw, prefs(over), new AlignmentTracker(), silentLogger);
+    const req = socket.sentJson().find((f) => f.type === 'request');
+    socket.emit({ type: 'response', id: req?.id, ok: true, result });
+    await p;
+    return { socket };
+  }
+
+  it('后端回传同模型 → 不发 change_llm', async () => {
+    const { socket } = await run(
+      {},
+      { asr: { model_size: 'base' }, translation: { model: 'hy-mt2-1.8b-q4km' } }
+    );
+    expect(socket.sentJson().some((f) => f.action === 'change_llm')).toBe(false);
+  });
+
+  it('后端回传不同模型 → 下发 store 偏好的 change_llm', async () => {
+    const { socket } = await run(
+      { translationModel: 'qwen3-1.7b-q4km' },
+      { asr: { model_size: 'base' }, translation: { model: 'hy-mt2-1.8b-q4km' } }
+    );
+    expect(socket.sentJson()).toContainEqual({
+      type: 'control', action: 'change_llm', model_id: 'qwen3-1.7b-q4km'
+    });
+  });
+
+  it('旧后端缺 translation.model → 容错不发送', async () => {
+    const { socket } = await run(
+      {},
+      { asr: { model_size: 'base' }, translation: {} }
+    );
+    expect(socket.sentJson().some((f) => f.action === 'change_llm')).toBe(false);
   });
 });

@@ -3,15 +3,18 @@ import { useNavigate } from 'react-router-dom';
 import { Captions, Check, SkipForward } from 'lucide-react';
 import { Button, ProgressBar, Select } from '../components/ui';
 import { useAppState } from '../state/hooks';
+import {
+  AUDIO_APPS_EMPTY_HINT,
+  AUDIO_APPS_UNSUPPORTED_HINT,
+  buildAudioSourceList,
+  decodeAudioSource,
+  fetchAudioSources,
+  toSelectOptions,
+  type AudioSourcesData
+} from '../state/audio-sources';
 import { DRAG_REGION } from './TitleBar';
 
 type Step = 'welcome' | 'audio' | 'download' | 'done';
-
-interface AudioSource {
-  id: string;
-  name: string;
-  is_loopback?: boolean;
-}
 
 /**
  * 首次运行引导（main-window spec）：欢迎 → 音频源 → 模型下载 → 完成。
@@ -22,9 +25,9 @@ export function OnboardingPage() {
   const state = useAppState();
 
   const [step, setStep] = useState<Step>('welcome');
-  const [devices, setDevices] = useState<AudioSource[] | null>(null);
-  const [deviceHint, setDeviceHint] = useState('');
-  const [selectedDevice, setSelectedDevice] = useState('');
+  const [audioData, setAudioData] = useState<AudioSourcesData | null>(null);
+  const [audioHint, setAudioHint] = useState('加载中…');
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [seenDownload, setSeenDownload] = useState(false);
 
   useEffect(() => {
@@ -33,19 +36,33 @@ export function OnboardingPage() {
 
   useEffect(() => {
     if (step !== 'audio') return;
-    setDeviceHint('加载中…');
-    window.appAPI
-      .wsRequest('get_audio_sources')
-      .then((resp) => {
-        if (!resp.ok) {
-          setDeviceHint(resp.error === 'not_connected' ? '后端尚未就绪，可稍后在设置中调整' : resp.message);
-          return;
+    let alive = true;
+    setAudioHint('加载中…');
+    fetchAudioSources()
+      .then((data) => {
+        if (!alive) return;
+        setAudioData(data);
+        const list = buildAudioSourceList(data);
+        if (data.deviceError && data.processError) {
+          setAudioHint('列表暂不可用（后端未就绪/未连接），可稍后在设置中调整');
+        } else if (data.processError) {
+          setAudioHint(`应用列表暂不可用：${data.processError}，可稍后在设置中调整`);
+        } else if (data.deviceError) {
+          setAudioHint(`设备列表暂不可用：${data.deviceError}，可稍后在设置中调整`);
+        } else if (!list.appsSupported) {
+          setAudioHint('当前系统仅支持"整个系统"回环捕获');
+        } else {
+          setAudioHint(
+            `发现 ${list.apps.length} 个正在发声的应用、${list.devices.length} 个回环设备`
+          );
         }
-        const list = (resp.result as AudioSource[]).filter((s) => s.is_loopback !== false);
-        setDevices(list);
-        setDeviceHint(`发现 ${list.length} 个回环设备`);
       })
-      .catch((e: unknown) => setDeviceHint(String(e)));
+      .catch((e: unknown) => {
+        if (alive) setAudioHint(`列表暂不可用：${String(e)}，可稍后在设置中调整`);
+      });
+    return () => {
+      alive = false;
+    };
   }, [step]);
 
   // 下载页自动前进：见过进度且当前无下载、后端已连
@@ -76,6 +93,8 @@ export function OnboardingPage() {
     </Button>
   );
 
+  const audioList = audioData ? buildAudioSourceList(audioData) : null;
+
   return (
     <div className="flex h-screen flex-col bg-base pt-9">
       {/* WCO 标题栏留白区（可拖动） */}
@@ -102,24 +121,34 @@ export function OnboardingPage() {
             <div className="flex flex-col gap-4">
               <h1 className="text-xl font-semibold text-primary">选择音频源</h1>
               <p className="text-base text-secondary">
-                字幕来自"回环捕获"——你听到的声音就是字幕的输入。默认设备即可用于绝大多数场景。
+                字幕来自"回环捕获"——你听到的声音就是字幕的输入。默认"整个系统"即可用于绝大多数场景；
+                也可只捕获某个应用的声音。
               </p>
               <Select
-                options={[
-                  { value: '', label: '默认回环设备（推荐）' },
-                  ...(devices ?? []).map((d) => ({ value: d.id, label: d.name }))
-                ]}
-                value={selectedDevice}
-                onChange={setSelectedDevice}
+                options={audioList ? toSelectOptions(audioList) : []}
+                value={selectedKey ?? audioList?.system.key ?? ''}
+                onChange={setSelectedKey}
+                disabled={audioList === null}
               />
-              <p className="text-xs text-secondary opacity-60">{deviceHint || ' '}</p>
+              {audioList && !audioData?.processError && !audioList.appsSupported && (
+                <p className="text-xs text-secondary opacity-60">{AUDIO_APPS_UNSUPPORTED_HINT}</p>
+              )}
+              {audioList && !audioData?.processError && audioList.appsSupported
+                && audioList.apps.length === 0 && (
+                <p className="text-xs text-secondary opacity-60">{AUDIO_APPS_EMPTY_HINT}</p>
+              )}
+              <p className="text-xs text-secondary opacity-60">{audioHint || ' '}</p>
               <div className="mt-2 flex items-center justify-between">
                 {skip}
                 <Button
                   variant="primary"
                   onClick={() => {
-                    if (selectedDevice !== '') {
-                      void window.appAPI.dispatch({ type: 'setAudioSource', id: selectedDevice });
+                    // 仅当选择了非默认源时下发；默认"整个系统"保持后端默认
+                    if (selectedKey && audioList && selectedKey !== audioList.system.key) {
+                      const source = decodeAudioSource(selectedKey);
+                      if (source) {
+                        void window.appAPI.dispatch({ type: 'setAudioSource', source });
+                      }
                     }
                     setStep('download');
                   }}

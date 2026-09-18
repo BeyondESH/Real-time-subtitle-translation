@@ -1,19 +1,23 @@
 """
 推理设备探测与静默降级决策。
 
-设计要点（design.md D7）：
+设计要点（design.md D5 / 原 design.md D7）：
 - ASR 经 faster-whisper → CTranslate2 执行，必须以 CTranslate2 的 CUDA 设备数探测；
-- 翻译经 transformers → torch 执行，必须以 torch 的 CUDA 可用性探测；
+- 翻译经 llama.cpp（随包 llama-server 子进程）执行，必须以该构建的
+  `--list-devices` 设备枚举探测（cuda 构建能枚举到 CUDA 设备才算可用）；
 - 两引擎独立判定，任一探针导入/调用异常一律降为不可用，异常 MUST NOT 逃逸；
 - 降级决策为纯函数（偏好 × 探针 × 加载结果 → 实际设备 + reason），便于单测。
 """
+from pathlib import Path  # noqa: F401 - 类型提示与测试替身使用
 from typing import Optional
+
+from llama_server_manager import list_devices, resolve_device_binary
 
 # 合法设备偏好（store / 控制协议 / config.yaml 同一词汇）
 VALID_DEVICES = ('auto', 'cpu', 'cuda')
 
-# 设备选择/降级原因枚举（design.md D8）
-DEVICE_REASONS = ('auto', 'user', 'no_cuda', 'load_failed')
+# 设备选择/降级原因枚举（design.md D8；runtime_failed=加载成功后运行期推理不可用）
+DEVICE_REASONS = ('auto', 'user', 'no_cuda', 'load_failed', 'runtime_failed')
 
 # 偏好为 cpu 或探针不可用时的 CPU 计算类型
 CPU_COMPUTE_TYPE = 'int8'
@@ -42,21 +46,28 @@ def _probe_ctranslate2() -> dict:
         }
 
 
-def _probe_torch() -> dict:
-    """翻译探针：torch CUDA 可用性（异常/缺失降为不可用）。"""
+def _probe_llama() -> dict:
+    """翻译探针：llama.cpp CUDA 构建的设备枚举（二进制缺失/异常/无设备降为不可用）。"""
     try:
-        import torch
-        available = bool(torch.cuda.is_available())
+        exe = resolve_device_binary(None, 'cuda')
+        if not exe.exists():
+            return {
+                'cuda_available': False,
+                'source': 'llama_cpp',
+                'detail': f'llama-server CUDA 构建缺失: {exe}',
+            }
+        devices = list_devices(exe)
+        cuda = [d for d in devices if d.upper().startswith('CUDA')]
         return {
-            'cuda_available': available,
-            'source': 'torch',
-            'detail': f'torch.cuda.is_available()={available}',
+            'cuda_available': bool(cuda),
+            'source': 'llama_cpp',
+            'detail': f'llama-server --list-devices: {"; ".join(devices) if devices else "(none)"}',
         }
     except Exception as e:  # noqa: BLE001 - 探针异常一律降为不可用，不让异常逃逸
         return {
             'cuda_available': False,
             'source': 'none',
-            'detail': f'torch 探针不可用: {e}',
+            'detail': f'llama.cpp 探针不可用: {e}',
         }
 
 
@@ -70,7 +81,7 @@ def probe_compute() -> dict:
     """
     return {
         'asr': _probe_ctranslate2(),
-        'translation': _probe_torch(),
+        'translation': _probe_llama(),
     }
 
 

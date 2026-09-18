@@ -13,6 +13,29 @@ const MAX_HISTORY = 5;
 const TOAST_MS = 5000;
 const WARN_STRIP_MS = 2000;
 
+type WarningStrip = NonNullable<AppStateView['lastWarning']>;
+
+/**
+ * 告警细条文案（subtitle-display spec「过载告警可视化」）：
+ * 按 reason 区分；未知 reason 回退泛化文案（含可用丢弃数），MUST NOT 抛错或空条。
+ */
+export function warningStripText(w: WarningStrip | null): string {
+  if (!w) return '';
+  const count = typeof w.droppedTotal === 'number' ? w.droppedTotal : 0;
+  switch (w.reason) {
+    case 'queue_full':
+      return `处理过载 · 累计丢弃 ${count} 句（建议切换更小的模型）`;
+    case 'stalled':
+      return w.message ?? '识别引擎停滞，正在自动恢复…';
+    case 'engine_degraded':
+      return w.message ?? '识别引擎已降级运行（建议切换更小的模型）';
+    default:
+      return count > 0
+        ? `识别引擎告警 · 累计丢弃 ${count} 句`
+        : '识别引擎告警（收到未知类型通知）';
+  }
+}
+
 interface CaptionEntry {
   seq: number;
   msg: SubtitleMessageView;
@@ -24,7 +47,7 @@ export function OverlayApp() {
   const [toast, setToast] = useState<ToastView | null>(null);
   const [modelDownload, setModelDownload] = useState<AppStateView['modelDownload']>(null);
   const [paused, setPaused] = useState(false);
-  const [warning, setWarning] = useState<{ droppedTotal: number } | null>(null);
+  const [warning, setWarning] = useState<WarningStrip | null>(null);
 
   const pausedRef = useRef(false);
   const seqRef = useRef(0);
@@ -73,7 +96,7 @@ export function OverlayApp() {
         if (patch.modelDownload !== undefined) setModelDownload(patch.modelDownload);
         if (patch.lastWarning !== undefined && patch.lastWarning !== null) {
           // 连续告警刷新同一条（重置换 2s 计时），不堆叠
-          setWarning({ droppedTotal: patch.lastWarning.droppedTotal });
+          setWarning(patch.lastWarning);
           if (warnTimer.current) clearTimeout(warnTimer.current);
           warnTimer.current = setTimeout(() => {
             warnTimer.current = null;
@@ -112,7 +135,7 @@ export function OverlayApp() {
     <div className="overlay-shell">
       {warning && (
         <div className="warn-strip">
-          处理过载 · 累计丢弃 {warning.droppedTotal} 句（建议切换更小的模型）
+          {warningStripText(warning)}
         </div>
       )}
 

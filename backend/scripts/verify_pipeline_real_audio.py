@@ -12,8 +12,9 @@
   4. 同语言跳过语义（source=target 时零推理、不加载翻译模型）
   5. VadStateBroadcaster 在真实语音上的翻转序列（speech → silence）
 
-不在范围（如实声明）: MT 真推理——本机无翻译模型缓存（NLLB 1.3GB 不擅自下载，
-且日语专用模型无对应 TTS 语音），该环节由 5.6 真实验收（播放日/英语内容）覆盖。
+不在范围（如实声明）: MT 真推理——翻译模型（Hy-MT2-1.8B GGUF，约 1.1GB）不随包，
+本脚本不擅自下载；且日语专用翻译模型无对应 TTS 语音，该环节由真机验收
+（播放日/英语内容）覆盖。
 """
 import asyncio
 import sys
@@ -58,12 +59,12 @@ def make_config(targets):
         'audio': {'sample_rate': SR, 'channels': 1, 'chunk_size': CHUNK},
         'asr': {'model_size': 'tiny', 'device': 'cpu', 'compute_type': 'int8', 'language': None},
         'translation': {
-            'primary_model': 'Helsinki-NLP/opus-mt-ja-zh',
-            'fallback_model': 'facebook/nllb-200-distilled-600M',
+            'default_model': 'hy-mt2-1.8b-q4km',
+            'download': {'source': 'auto'},
             'target_languages': targets,
             'device': 'cpu',
-            'lazy_load': True,
-            'preload_primary': False,
+            'n_ctx': 4096,
+            'timeout_s': 30,
         },
     }
 

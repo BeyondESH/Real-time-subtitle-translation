@@ -27,12 +27,26 @@ export interface ModelProgressMessage {
   message: string;
 }
 
+/**
+ * 告警原因（design D5）：既有 queue_full 语义保留，新增 stalled / engine_degraded。
+ * 开放联合：`(string & {})` 保留字面量补全，同时允许后端未来新增 reason 透传。
+ */
+export type PipelineWarningReason =
+  | 'queue_full'
+  | 'stalled'
+  | 'engine_degraded'
+  | (string & {});
+
 export interface PipelineWarningMessage {
   type: 'pipeline_warning';
-  reason?: string;
-  /** 后端累计丢弃数 */
+  reason?: PipelineWarningReason;
+  /** 后端累计丢弃数（旧后端 / 未知 reason 可能缺失，消费方需容错） */
   dropped?: number;
   message?: string;
+  /** 停滞时队列深度（D5 纯增量字段，可选） */
+  pending?: number;
+  /** 结构化补充信息，如 engine_degraded 的 {engine, from, to, device_reason} */
+  detail?: Record<string, unknown>;
 }
 
 export interface BackendErrorMessage {
@@ -50,8 +64,8 @@ export interface VadStateMessage {
 /** 实际解析出的设备（null = 加载/检测中） */
 export type DeviceResolved = 'cuda' | 'cpu' | null;
 
-/** 设备原因：用户指定 / 自动检测成功 / 无 CUDA / GPU 加载失败降级 */
-export type DeviceReason = 'auto' | 'user' | 'no_cuda' | 'load_failed';
+/** 设备原因：用户指定 / 自动检测成功 / 无 CUDA / GPU 加载失败 / 运行期失败降级 */
+export type DeviceReason = 'auto' | 'user' | 'no_cuda' | 'load_failed' | 'runtime_failed';
 
 export interface DeviceEngineState {
   resolved: DeviceResolved;
@@ -71,13 +85,25 @@ export interface DeviceStateMessage {
 /** device_state 去掉 type 后的视图（AppState.device / get_config 种子形状） */
 export type DeviceStateView = Omit<DeviceStateMessage, 'type'>;
 
+/**
+ * 音频源退出广播（pipeline-control spec：按进程捕获目标退出并回退后触发）。
+ * 事件驱动；无客户端连接时后端跳过广播，消费方对未知类型安全。
+ */
+export interface AudioSourceLostMessage {
+  type: 'audio_source_lost';
+  name: string;
+  pid: number;
+  fallback: 'system';
+}
+
 export type KnownBroadcast =
   | SubtitleMessage
   | ModelProgressMessage
   | PipelineWarningMessage
   | BackendErrorMessage
   | VadStateMessage
-  | DeviceStateMessage;
+  | DeviceStateMessage
+  | AudioSourceLostMessage;
 
 export type UnknownBroadcast = { type: string } & Record<string, unknown>;
 

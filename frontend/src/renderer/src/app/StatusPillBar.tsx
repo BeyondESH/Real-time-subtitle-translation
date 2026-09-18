@@ -1,15 +1,25 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Cpu, Languages, Mic } from 'lucide-react';
 import { Pill, StatusDot, cx } from '../components/ui';
+import type { AudioSourceTarget } from '../../../shared/ipc-types';
 import { langLabel } from './lang-labels';
+import {
+  AUDIO_APPS_EMPTY_HINT,
+  AUDIO_APPS_TITLE,
+  AUDIO_APPS_UNSUPPORTED_HINT,
+  AUDIO_DEVICES_EMPTY_HINT,
+  AUDIO_DEVICES_TITLE,
+  AUDIO_POLL_MS,
+  buildAudioSourceList,
+  fetchAudioSources,
+  isAudioOptionSelected,
+  resolveAudioSourceLabel,
+  stateAudioPref,
+  type AudioSourceList,
+  type AudioSourcesData
+} from '../state/audio-sources';
 
 const WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large-v3'];
-
-interface AudioSource {
-  id: string;
-  name: string;
-  is_loopback?: boolean;
-}
 
 type PanelKind = 'audio' | 'model' | 'lang' | null;
 
@@ -25,43 +35,51 @@ function connectionPresentation(state: AppStateView): {
 }
 
 /** 底部状态胶囊条（composer 形态：只读状态 + 就地切换面板） */
-export function StatusPillBar({ state }: { state: AppStateView }) {
+export function StatusPillBar({
+  state, cfg
+}: {
+  state: AppStateView;
+  cfg?: AppConfigView | null;
+}) {
   const [panel, setPanel] = useState<PanelKind>(null);
-  const [devices, setDevices] = useState<AudioSource[] | null>(null);
-  const [deviceError, setDeviceError] = useState<string | null>(null);
+  const [audioData, setAudioData] = useState<AudioSourcesData | null>(null);
+  const [audioLoading, setAudioLoading] = useState(false);
 
   const conn = connectionPresentation(state);
 
-  const loadDevices = (): void => {
-    setDeviceError(null);
-    window.appAPI
-      .wsRequest('get_audio_sources')
-      .then((resp) => {
-        if (!resp.ok) {
-          setDevices(null);
-          setDeviceError(resp.error === 'not_connected' ? '后端未连接' : resp.message);
-          return;
-        }
-        const list = resp.result as AudioSource[];
-        setDevices(list.filter((s) => s.is_loopback !== false));
-      })
+  const loadAudio = useCallback((): void => {
+    setAudioLoading(true);
+    void fetchAudioSources()
+      .then(setAudioData)
       .catch((e: unknown) => {
-        setDevices(null);
-        setDeviceError(String(e));
-      });
-  };
+        const text = String(e);
+        setAudioData({ devices: null, deviceError: text, processes: null, processError: text });
+      })
+      .finally(() => setAudioLoading(false));
+  }, []);
 
+  // 面板打开：拉取一次；保持打开期间每 3s 轻量轮询；关闭/切面板时清理
   useEffect(() => {
-    if (panel === 'audio') loadDevices();
-  }, [panel]);
+    if (panel !== 'audio') return;
+    setAudioData(null);
+    loadAudio();
+    const timer = window.setInterval(loadAudio, AUDIO_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [panel, loadAudio]);
 
   const toggle = (kind: Exclude<PanelKind, null>): void => {
     setPanel((prev) => (prev === kind ? null : kind));
   };
 
-  const audioName = state.audioSource === ''
-    ? '默认回环设备'
-    : devices?.find((d) => d.id === state.audioSource)?.name ?? state.audioSource;
+  const selectSource = (source: AudioSourceTarget): void => {
+    void window.appAPI.dispatch({ type: 'setAudioSource', source });
+    setPanel(null);
+  };
+
+  const list: AudioSourceList | null = audioData ? buildAudioSourceList(audioData) : null;
+  const pref: AudioSourcePrefView | null = cfg?.audio.source
+    ?? (list ? stateAudioPref(state.audioSource, list) : null);
+  const audioName = resolveAudioSourceLabel(state.audioSource, list);
 
   const panelClass = cx(
     'panel-enter absolute bottom-full left-0 z-40 mb-2 w-72 rounded-card border border-edge',
@@ -78,40 +96,59 @@ export function StatusPillBar({ state }: { state: AppStateView }) {
           </Pill>
           {panel === 'audio' && (
             <span className={panelClass}>
-              {deviceError && (
-                <span className="block px-2 py-2 text-xs text-danger">
-                  {deviceError}
-                  <button
-                    type="button"
-                    className="ml-2 underline"
-                    onClick={loadDevices}
-                  >
-                    重试
-                  </button>
-                </span>
+              {audioLoading && !audioData && (
+                <HintRow>加载中…</HintRow>
               )}
-              {!deviceError && !devices && <span className="block px-2 py-2 text-xs text-secondary">加载中…</span>}
-              {devices && (
-                <span className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
+              {audioData && list && pref && (
+                <span className="flex max-h-72 flex-col gap-0.5 overflow-y-auto">
                   <DeviceItem
-                    label="默认回环设备"
-                    selected={state.audioSource === ''}
-                    onSelect={() => {
-                      void window.appAPI.dispatch({ type: 'setAudioSource', id: '' });
-                      setPanel(null);
-                    }}
+                    label={list.system.label}
+                    selected={isAudioOptionSelected(pref, list.system)}
+                    onSelect={() => selectSource(list.system.source)}
                   />
-                  {devices.map((d) => (
-                    <DeviceItem
-                      key={d.id}
-                      label={d.name}
-                      selected={state.audioSource === d.id}
-                      onSelect={() => {
-                        void window.appAPI.dispatch({ type: 'setAudioSource', id: d.id });
-                        setPanel(null);
-                      }}
-                    />
-                  ))}
+
+                  {/* 应用进程（supported=false 隐藏，附说明） */}
+                  {audioData.processError && (
+                    <ErrorRow text={`应用：${audioData.processError}`} onRetry={loadAudio} />
+                  )}
+                  {!audioData.processError && list.appsSupported && (
+                    <>
+                      <SectionLabel>{AUDIO_APPS_TITLE}</SectionLabel>
+                      {list.apps.length === 0
+                        ? <HintRow>{AUDIO_APPS_EMPTY_HINT}</HintRow>
+                        : list.apps.map((o) => (
+                          <DeviceItem
+                            key={o.key}
+                            label={o.label}
+                            selected={isAudioOptionSelected(pref, o)}
+                            onSelect={() => selectSource(o.source)}
+                          />
+                        ))}
+                    </>
+                  )}
+                  {!audioData.processError && !list.appsSupported && (
+                    <HintRow>{AUDIO_APPS_UNSUPPORTED_HINT}</HintRow>
+                  )}
+
+                  {/* 回环设备 */}
+                  {audioData.deviceError && (
+                    <ErrorRow text={`设备：${audioData.deviceError}`} onRetry={loadAudio} />
+                  )}
+                  {!audioData.deviceError && (
+                    <>
+                      <SectionLabel>{AUDIO_DEVICES_TITLE}</SectionLabel>
+                      {list.devices.length === 0
+                        ? <HintRow>{AUDIO_DEVICES_EMPTY_HINT}</HintRow>
+                        : list.devices.map((o) => (
+                          <DeviceItem
+                            key={o.key}
+                            label={o.label}
+                            selected={isAudioOptionSelected(pref, o)}
+                            onSelect={() => selectSource(o.source)}
+                          />
+                        ))}
+                    </>
+                  )}
                 </span>
               )}
             </span>
@@ -186,6 +223,27 @@ export function StatusPillBar({ state }: { state: AppStateView }) {
         )}
       </div>
     </div>
+  );
+}
+
+function SectionLabel({ children }: { children: string }) {
+  return (
+    <span className="block px-2 pb-0.5 pt-2 text-[11px] text-secondary opacity-60">{children}</span>
+  );
+}
+
+function HintRow({ children }: { children: string }) {
+  return <span className="block px-2 py-1.5 text-xs text-secondary opacity-60">{children}</span>;
+}
+
+function ErrorRow({ text, onRetry }: { text: string; onRetry(): void }) {
+  return (
+    <span className="block px-2 py-2 text-xs text-danger">
+      {text}
+      <button type="button" className="ml-2 underline" onClick={onRetry}>
+        重试
+      </button>
+    </span>
   );
 }
 

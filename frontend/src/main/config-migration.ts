@@ -8,6 +8,11 @@
  */
 import * as fs from 'fs';
 import { load as loadYaml } from 'js-yaml';
+import {
+  DEFAULT_AUDIO_SOURCE, type AudioSourcePref, type AudioSourceTarget
+} from '../shared/ipc-types';
+
+export type { AudioSourcePref, AudioSourceTarget } from '../shared/ipc-types';
 
 // ---------- 规范 schema（向后兼容旧 store 键路径） ----------
 
@@ -44,6 +49,9 @@ export interface ShortcutSet {
 /** 推理设备偏好（统一管 ASR 与翻译；与后端控制协议同词汇） */
 export type InferenceDevice = 'auto' | 'cpu' | 'cuda';
 
+/** 默认翻译模型（与后端注册表默认一致；store 偏好键 translation.model） */
+export const DEFAULT_TRANSLATION_MODEL = 'hy-mt2-1.8b-q4km';
+
 export interface AppConfig {
   window: WindowConfig;
   subtitle: SubtitleConfig;
@@ -51,11 +59,12 @@ export interface AppConfig {
   shortcuts: ShortcutSet;
   /** 全局快捷键注册结果（false=被占用，设置页警示） */
   shortcutStatus: Record<keyof ShortcutSet, boolean>;
-  translation: { targetLanguages: string[]; activeLanguage: string };
+  translation: { targetLanguages: string[]; activeLanguage: string; model: string };
   asr: { model: string };
   /** 推理设备偏好；auto=后端自动探测（显式 cpu/cuda 经 SUBTITLE_DEVICE 注入） */
   inference: { device: InferenceDevice };
-  audio: { sourceId: string };
+  /** 音频源偏好（结构化：设备源或按进程源） */
+  audio: { source: AudioSourcePref };
   locked: boolean;
   /** 主题：dark（默认）/ light / system */
   theme: 'dark' | 'light' | 'system';
@@ -95,10 +104,14 @@ export const CONFIG_DEFAULTS: AppConfig = {
   shortcutStatus: {
     togglePause: true, switchLanguage: true, switchModel: true, toggleLock: true
   },
-  translation: { targetLanguages: ['zh', 'en'], activeLanguage: 'zh' },
+  translation: {
+    targetLanguages: ['zh', 'en'],
+    activeLanguage: 'zh',
+    model: DEFAULT_TRANSLATION_MODEL
+  },
   asr: { model: 'base' },
   inference: { device: 'auto' },
-  audio: { sourceId: '' },
+  audio: { source: { ...DEFAULT_AUDIO_SOURCE } },
   locked: true,
   theme: 'dark',
   system: { autoStart: false },
@@ -110,6 +123,69 @@ export const CONFIG_DEFAULTS: AppConfig = {
   onboarding: { completed: false },
   legacyMigrated: false
 };
+
+// ---------- 音频源（结构化，settings-management spec D10） ----------
+
+function isAudioSourcePref(v: unknown): v is AudioSourcePref {
+  if (v === null || typeof v !== 'object') return false;
+  const rec = v as Record<string, unknown>;
+  if (rec.kind === 'device') return typeof rec.id === 'string';
+  if (rec.kind === 'process') {
+    return typeof rec.name === 'string'
+      && (rec.lastPid === null || typeof rec.lastPid === 'number');
+  }
+  return false;
+}
+
+/**
+ * 音频源规范化（幂等）：`audio.source` 合法时原样返回；缺失/形状非法时
+ * 按旧裸字符串 `audio.sourceId` 解释为设备源（`''` = 默认设备）。
+ * 旧键 `sourceId` 由调用方保留不改写，规范化后不再读取。
+ */
+export function resolveAudioSection(raw: unknown): { source: AudioSourcePref; changed: boolean } {
+  const rec = (raw !== null && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  if (isAudioSourcePref(rec.source)) {
+    return { source: rec.source, changed: false };
+  }
+  const legacyId = typeof rec.sourceId === 'string' ? rec.sourceId : '';
+  return { source: { kind: 'device', id: legacyId }, changed: true };
+}
+
+/** 音频源稳定键（对齐会话级幂等/同值比较）：device:<id> / process:<name> */
+export function audioSourceKey(source: AudioSourcePref): string {
+  return source.kind === 'device' ? `device:${source.id}` : `process:${source.name}`;
+}
+
+/** 同源比较：仅比较形态与标识（进程 PID 变化不视为换源，绑定一律以列表 PID 为准） */
+export function sameAudioSource(a: AudioSourcePref, b: AudioSourcePref): boolean {
+  return audioSourceKey(a) === audioSourceKey(b);
+}
+
+/** 展示/会话历史标签：设备源=id（`''` = 整个系统），进程源=进程名 */
+export function audioSourceLabel(source: AudioSourcePref): string {
+  return source.kind === 'device' ? source.id : source.name;
+}
+
+/** store 偏好 → 线上目标；进程源缺 PID（理论不可达）时返回 null（不可下发） */
+export function audioSourceToTarget(pref: AudioSourcePref): AudioSourceTarget | null {
+  if (pref.kind === 'device') return { kind: 'device', id: pref.id };
+  return pref.lastPid === null ? null : { kind: 'process', pid: pref.lastPid, name: pref.name };
+}
+
+/** 线上目标 → store 偏好（进程 pid → lastPid 持久化） */
+export function audioSourceFromTarget(target: AudioSourceTarget): AudioSourcePref {
+  return target.kind === 'device'
+    ? { kind: 'device', id: target.id }
+    : { kind: 'process', name: target.name, lastPid: target.pid };
+}
+
+/** 线上目标同值比较（含 PID：同名不同实例视为换源） */
+export function sameAudioTarget(a: AudioSourceTarget, b: AudioSourceTarget): boolean {
+  if (a.kind === 'device' || b.kind === 'device') {
+    return a.kind === 'device' && b.kind === 'device' && a.id === b.id;
+  }
+  return a.pid === b.pid && a.name === b.name;
+}
 
 // ---------- 旧 config.yaml → store 一次性迁移 ----------
 

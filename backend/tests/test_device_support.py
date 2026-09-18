@@ -1,5 +1,5 @@
 """
-设备探测与静默降级决策纯函数测试（monkeypatch ct2/torch 全组合）
+设备探测与静默降级决策纯函数测试（monkeypatch ct2/llama 全组合）
 
 不加载真实模型、不访问网络。
 """
@@ -28,72 +28,95 @@ def fake_ct2(count=None, raises=None):
     return module
 
 
-def fake_torch(available=None, raises=None):
-    module = types.SimpleNamespace()
-    if raises is not None:
-        def _boom():
-            raise raises
-        module.cuda = types.SimpleNamespace(is_available=_boom)
-    else:
-        module.cuda = types.SimpleNamespace(is_available=lambda: available)
-    return module
+@pytest.fixture
+def llama_probe(monkeypatch, tmp_path):
+    """
+    替身化 llama.cpp 翻译探针的底层输入：
+    - devices: `--list-devices` 的返回行
+    - raises: list_devices 抛出的异常
+    - missing: 二进制缺失场景
+    """
+    def _setup(devices=None, raises=None, missing=False):
+        exe = tmp_path / ('missing.exe' if missing else 'llama-server.exe')
+        if not missing:
+            exe.write_bytes(b'')
+        monkeypatch.setattr(
+            'device_support.resolve_device_binary', lambda root, device: exe
+        )
+        if raises is not None:
+            def _boom(_exe):
+                raise raises
+            monkeypatch.setattr('device_support.list_devices', _boom)
+        else:
+            monkeypatch.setattr(
+                'device_support.list_devices', lambda _exe: list(devices or [])
+            )
+    return _setup
 
 
 class TestProbeCompute:
-    def test_both_available(self, monkeypatch):
+    def test_both_available(self, monkeypatch, llama_probe):
         monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(1))
-        monkeypatch.setitem(sys.modules, 'torch', fake_torch(True))
+        llama_probe(devices=['CUDA0: NVIDIA GeForce RTX 5060 (8123 MiB, 7031 MiB free)'])
         result = probe_compute()
         assert result['asr']['cuda_available'] is True
         assert result['asr']['source'] == 'ctranslate2'
         assert result['translation']['cuda_available'] is True
-        assert result['translation']['source'] == 'torch'
+        assert result['translation']['source'] == 'llama_cpp'
 
-    def test_asr_only(self, monkeypatch):
-        """CTranslate2 可用而 torch 为 CPU 构建（本变更的实证场景）"""
+    def test_asr_only(self, monkeypatch, llama_probe):
+        """CTranslate2 可用而 llama.cpp 枚举不到 CUDA 设备（或仅为 CPU 构建）"""
         monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(1))
-        monkeypatch.setitem(sys.modules, 'torch', fake_torch(False))
+        llama_probe(devices=[])
         result = probe_compute()
         assert result['asr']['cuda_available'] is True
         assert result['translation']['cuda_available'] is False
 
-    def test_translation_only(self, monkeypatch):
+    def test_translation_only(self, monkeypatch, llama_probe):
         monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(0))
-        monkeypatch.setitem(sys.modules, 'torch', fake_torch(True))
+        llama_probe(devices=['CUDA0: NVIDIA GeForce RTX 5060 (8123 MiB, 7031 MiB free)'])
         result = probe_compute()
         assert result['asr']['cuda_available'] is False
         assert result['translation']['cuda_available'] is True
 
-    def test_both_unavailable(self, monkeypatch):
+    def test_both_unavailable(self, monkeypatch, llama_probe):
         monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(0))
-        monkeypatch.setitem(sys.modules, 'torch', fake_torch(False))
+        llama_probe(devices=['(none)'])
         result = probe_compute()
         assert result['asr']['cuda_available'] is False
         assert result['translation']['cuda_available'] is False
 
-    def test_probe_exceptions_do_not_escape(self, monkeypatch):
+    def test_probe_exceptions_do_not_escape(self, monkeypatch, llama_probe):
         monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(raises=RuntimeError('ct2 炸了')))
-        monkeypatch.setitem(sys.modules, 'torch', fake_torch(raises=RuntimeError('torch 炸了')))
+        llama_probe(raises=RuntimeError('llama 炸了'))
         result = probe_compute()  # MUST NOT raise
         assert result['asr']['cuda_available'] is False
         assert result['asr']['source'] == 'none'
         assert 'ct2 炸了' in result['asr']['detail']
         assert result['translation']['cuda_available'] is False
         assert result['translation']['source'] == 'none'
-        assert 'torch 炸了' in result['translation']['detail']
+        assert 'llama 炸了' in result['translation']['detail']
 
-    def test_probe_import_error_do_not_escape(self, monkeypatch):
+    def test_probe_import_error_do_not_escape(self, monkeypatch, llama_probe):
         # None in sys.modules → import 抛 ImportError，应被吞掉
         monkeypatch.setitem(sys.modules, 'ctranslate2', None)
-        monkeypatch.setitem(sys.modules, 'torch', None)
+        llama_probe(missing=True)
         result = probe_compute()
         assert result['asr']['cuda_available'] is False
         assert result['translation']['cuda_available'] is False
+        assert '缺失' in result['translation']['detail']
 
-    def test_probes_independent(self, monkeypatch):
+    def test_binary_missing_degrades(self, llama_probe):
+        llama_probe(missing=True)
+        result = probe_compute()
+        assert result['translation']['cuda_available'] is False
+        assert result['translation']['source'] == 'llama_cpp'
+        assert '缺失' in result['translation']['detail']
+
+    def test_probes_independent(self, monkeypatch, llama_probe):
         """一个探针异常不影响另一个的判定"""
         monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(raises=RuntimeError('x')))
-        monkeypatch.setitem(sys.modules, 'torch', fake_torch(True))
+        llama_probe(devices=['CUDA0: NVIDIA GeForce RTX 5060 (8123 MiB, 7031 MiB free)'])
         result = probe_compute()
         assert result['asr']['cuda_available'] is False
         assert result['translation']['cuda_available'] is True
@@ -135,7 +158,7 @@ class TestDecideDevice:
             decide_device('tpu', {'cuda_available': True})
 
     def test_reasons_enum_is_exact(self):
-        assert DEVICE_REASONS == ('auto', 'user', 'no_cuda', 'load_failed')
+        assert DEVICE_REASONS == ('auto', 'user', 'no_cuda', 'load_failed', 'runtime_failed')
 
 
 class TestNormalizeDevice:

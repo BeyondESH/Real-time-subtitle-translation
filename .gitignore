@@ -76,3 +76,11 @@ openspec/
 .claude/skills/code-index-*/
 .claude/settings.local.json
 opencode.json
+
+# Test artifacts (add-per-process-audio-capture)
+backend/scripts/spike_out.wav
+frontend/e2e-artifacts/
+
+# Vendored llama.cpp binaries（大文件，不入库；用 backend/scripts/vendor_llama.ps1 获取）
+backend/vendor/llama/win-x64-cpu/
+backend/vendor/llama/win-x64-cuda/

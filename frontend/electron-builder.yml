@@ -26,6 +26,12 @@ extraResources:
     to: backend/
   - from: ../config.yaml
     to: config.yaml
+  # llama.cpp sidecar 双构建（翻译引擎运行时；后端经 SUBTITLE_LLAMA_DIR 定位）
+  - from: ../backend/vendor/llama/
+    to: llama/
+  # 第三方许可证归档（Hy-MT2 / llama.cpp 等）
+  - from: ../backend/third_party_licenses/
+    to: licenses/
 
 # 仅 Windows（WASAPI 限定）
 win:

@@ -6,6 +6,26 @@
  */
 export * from '../main/types';
 
+/**
+ * 音频源偏好（结构化，settings-management spec）：
+ * - device：回环设备源，`id=''` = 整个系统（默认设备）
+ * - process：按应用进程捕获，`lastPid` 记录最近绑定的 PID（仅展示/重选参考，绑定以列表 PID 为准）
+ */
+export type AudioSourcePref =
+  | { kind: 'device'; id: string }
+  | { kind: 'process'; name: string; lastPid: number | null };
+
+/** 默认音频源 = 整个系统（默认回环设备） */
+export const DEFAULT_AUDIO_SOURCE: AudioSourcePref = { kind: 'device', id: '' };
+
+/**
+ * 音频源目标（控制协议 `set_audio_source.source` 的线上形状，与后端同词汇）：
+ * 进程源携带精确 PID（同名多实例以 PID 绑定）；store 持久化使用 `lastPid`。
+ */
+export type AudioSourceTarget =
+  | { kind: 'device'; id: string }
+  | { kind: 'process'; pid: number; name: string };
+
 /** UI/托盘/快捷键统一动作入口（client-gateway-state spec：三源同 dispatch） */
 export type Intent =
   | { type: 'togglePause' }
@@ -13,9 +33,10 @@ export type Intent =
   | { type: 'cycleModel' }
   | { type: 'setLanguage'; language: string }
   | { type: 'setModel'; model: string }
+  | { type: 'setLlm'; modelId: string }
   | { type: 'toggleLock' }
   | { type: 'toggleOverlay' }
-  | { type: 'setAudioSource'; id: string }
+  | { type: 'setAudioSource'; source: AudioSourceTarget }
   | { type: 'setDevice'; device: 'auto' | 'cpu' | 'cuda' }
   | { type: 'newSession' }
   | { type: 'showSettings' }
@@ -36,9 +57,10 @@ export const WRITABLE_CONFIG_PATHS: readonly string[] = [
   'translation',
   'translation.targetLanguages',
   'translation.activeLanguage',
+  'translation.model',
   'asr.model',
   'inference.device',
-  'audio.sourceId',
+  'audio.source',
   'window.opacity',
   'window.displayId',
   'shortcuts',

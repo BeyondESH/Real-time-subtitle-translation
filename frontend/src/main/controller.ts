@@ -10,10 +10,15 @@ import type { AppState, StateStore } from './state';
 import type { ConfigStore } from './config';
 import type { HistoryStore } from './history-db';
 import { AlignmentTracker, alignPreferences, deviceViewFromBroadcast, type PrefsSnapshot } from './prefs-align';
+import {
+  audioSourceFromTarget, audioSourceLabel, audioSourceToTarget, sameAudioTarget
+} from './config-migration';
 import type {
-  BackendErrorMessage, DeviceStateView, GatewayLogger, Intent, KnownBroadcast, ModelProgressMessage,
-  PipelineWarningMessage, SubtitleMessage, ToastMessage, UnknownBroadcast, VadStateMessage
+  AudioSourceLostMessage, AudioSourcePref, BackendErrorMessage, DeviceStateView, GatewayLogger,
+  Intent, KnownBroadcast, ModelProgressMessage, PipelineWarningMessage, SubtitleMessage,
+  ToastMessage, UnknownBroadcast, VadStateMessage
 } from '../shared/ipc-types';
+import { DEFAULT_AUDIO_SOURCE } from '../shared/ipc-types';
 
 export const WHISPER_MODELS: readonly string[] = [
   'tiny', 'base', 'small', 'medium', 'large-v3'
@@ -45,11 +50,18 @@ export class Controller {
    */
   private readonly optimistic: {
     model?: string;
+    llm?: string;
     activeLanguage?: string;
-    audioSource?: string;
+    audioSource?: AudioSourcePref;
     device?: 'auto' | 'cpu' | 'cuda';
     deviceState?: DeviceStateView | null;
   } = {};
+
+  /**
+   * 对齐路径待确认音频源（D9）：align 下发 set_audio_source 后置位；若后端以
+   * invalid_audio_source 拒绝且无用户乐观锚点，则按"粘性回退默认设备"处理。
+   */
+  private pendingAlignSource: AudioSourcePref | null = null;
 
   constructor(private readonly deps: ControllerDeps) {
     this.wireGateway();
@@ -63,15 +75,22 @@ export class Controller {
       targetLanguages: t.targetLanguages,
       activeLanguage: t.activeLanguage,
       model: this.deps.config.get('asr').model,
-      audioSourceId: this.deps.config.get('audio').sourceId,
+      translationModel: t.model,
+      audioSource: this.deps.config.get('audio').source,
       device: this.deps.config.get('inference').device
     };
   }
 
   /** 连接建立/配置保存后把后端运行态对齐到 store 偏好（含实际设备种入 AppState） */
   async align(): Promise<void> {
+    const prefs = this.prefs();
+    // 记录本次对齐将下发的源（默认设备不发）；无用户锚点的 invalid_audio_source
+    // 视为对齐路径拒绝 → 粘性回退默认设备（D6/D9）
+    this.pendingAlignSource = prefs.audioSource.kind === 'device' && prefs.audioSource.id === ''
+      ? null
+      : prefs.audioSource;
     const view = await alignPreferences(
-      this.deps.gateway, this.prefs(), this.deps.tracker, this.deps.logger
+      this.deps.gateway, prefs, this.deps.tracker, this.deps.logger
     );
     if (view) {
       this.deps.state.dispatch({ type: 'deviceChanged', device: view });
@@ -133,6 +152,16 @@ export class Controller {
         this.applyModel(intent.model);
         return;
       }
+      case 'setLlm': {
+        if (typeof intent.modelId !== 'string' || intent.modelId === '') {
+          this.toast(`不支持的翻译模型: ${String(intent.modelId)}`, 'error');
+          return;
+        }
+        const p = this.prefs();
+        if (p.translationModel === intent.modelId) return;
+        this.applyLlm(intent.modelId);
+        return;
+      }
       case 'toggleLock': {
         const next = !this.deps.state.getState().locked;
         this.deps.config.set('locked', next);
@@ -145,20 +174,28 @@ export class Controller {
         return;
       }
       case 'setAudioSource': {
-        const prev = this.prefs().audioSourceId;
-        if (prev === intent.id) return;
+        const prev = this.prefs().audioSource;
+        const next = audioSourceFromTarget(intent.source);
+        // 同值跳过按"线上目标"比较（含 PID：同名不同实例视为换源）
+        const prevTarget = audioSourceToTarget(prev);
+        if (prevTarget !== null && sameAudioTarget(prevTarget, intent.source)) return;
         this.optimistic.audioSource = prev;
+        this.pendingAlignSource = null; // 用户主动切换：覆盖对齐路径标记
         this.deps.gateway.send({
-          type: 'control', action: 'set_audio_source', source_id: intent.id
+          type: 'control', action: 'set_audio_source', source: intent.source
         });
-        this.deps.config.set('audio', { sourceId: intent.id });
-        this.deps.state.dispatch({ type: 'audioSourceChanged', audioSource: intent.id });
+        this.deps.config.set('audio', { source: next });
+        this.deps.state.dispatch({
+          type: 'audioSourceChanged', audioSource: audioSourceLabel(next)
+        });
         return;
       }
       case 'newSession': {
         const h = this.deps.history;
         if (!h) return;
-        const id = h.newSession(Date.now(), this.deps.config.get('audio').sourceId);
+        const id = h.newSession(
+          Date.now(), audioSourceLabel(this.deps.config.get('audio').source)
+        );
         this.deps.state.dispatch({ type: 'activeSessionChanged', id });
         this.deps.broadcast('history:changed', { kind: 'session' });
         return;
@@ -198,9 +235,11 @@ export class Controller {
     if (!sameArray(s.targetLanguages, next.targetLanguages)) {
       patch.targetLanguages = [...next.targetLanguages];
     }
-    if (s.audioSource !== next.audioSourceId) {
-      this.optimistic.audioSource = s.audioSource;
-      patch.audioSource = next.audioSourceId;
+    // 音频源：配置写入路径不设用户乐观锚点（形态不定）；差异经 align 下发，
+    // 拒绝时按对齐路径粘性回退默认设备（D9）
+    const nextAudioLabel = audioSourceLabel(next.audioSource);
+    if (s.audioSource !== nextAudioLabel) {
+      patch.audioSource = nextAudioLabel;
     }
     if (Object.keys(patch).length > 0) {
       this.deps.state.dispatch({ type: 'configApplied', patch });
@@ -234,6 +273,13 @@ export class Controller {
     this.deps.gateway.send({ type: 'control', action: 'change_model', model_size: next });
     this.deps.config.set('asr', { model: next });
     this.deps.state.dispatch({ type: 'modelChanged', model: next });
+  }
+
+  private applyLlm(next: string): void {
+    const t = this.deps.config.get('translation');
+    this.optimistic.llm = t.model;
+    this.deps.gateway.send({ type: 'control', action: 'change_llm', model_id: next });
+    this.deps.config.set('translation', { ...t, model: next });
   }
 
   private applyDevice(next: 'auto' | 'cpu' | 'cuda'): void {
@@ -284,16 +330,25 @@ export class Controller {
         const w = msg as PipelineWarningMessage;
         this.deps.state.dispatch({
           type: 'pipelineWarning',
-          droppedTotal: typeof w.dropped === 'number' ? w.dropped : undefined
+          droppedTotal: typeof w.dropped === 'number' ? w.dropped : undefined,
+          reason: typeof w.reason === 'string' ? w.reason : undefined,
+          message: typeof w.message === 'string' ? w.message : undefined,
+          pending: typeof w.pending === 'number' ? w.pending : undefined,
+          detail: asDetail(w.detail)
         });
-        this.toast(w.message ?? '处理过载：已丢弃最旧语句（建议换更小的模型）', 'warn');
+        this.toast(warningToastText(w.reason, w.message), 'warn');
         return;
       }
       case 'error': {
         const err = msg as BackendErrorMessage;
         this.deps.logger.warn('后端错误回执:', err.code ?? '-', err.message ?? '');
-        this.rollbackIfRejected(err.code);
-        this.toast(err.message ?? '后端错误', 'error');
+        const handled = this.rollbackIfRejected(err.code);
+        if (handled === 'audio_align_reset') {
+          // 对齐路径拒绝：粘性回退已发生，仅一条提示（不叠加通用错误 toast）
+          this.toast('音频源不可用，已切换为整个系统', 'warn');
+        } else {
+          this.toast(err.message ?? '后端错误', 'error');
+        }
         return;
       }
       case 'vad_state': {
@@ -311,18 +366,29 @@ export class Controller {
         });
         return;
       }
+      case 'audio_source_lost': {
+        // D6 粘性重置：目标进程退出 → toast + store/state 同步回默认设备，
+        // 避免"启动时进程不可用 → 对齐失败 → 回滚 → 下次再试"的重试循环
+        const lost = msg as AudioSourceLostMessage;
+        this.toast(`音频源「${lost.name}」已退出，已切换为整个系统`, 'warn');
+        this.pendingAlignSource = null;
+        this.optimistic.audioSource = undefined;
+        this.deps.config.set('audio', { source: { ...DEFAULT_AUDIO_SOURCE } });
+        this.deps.state.dispatch({ type: 'audioSourceChanged', audioSource: '' });
+        return;
+      }
       default:
         this.deps.logger.info('未路由的广播类型:', msg.type);
     }
   }
 
   /** 后端否定回执 → 按锚点回退乐观更新（config + state 同步恢复） */
-  private rollbackIfRejected(code: string | undefined): void {
+  private rollbackIfRejected(code: string | undefined): 'audio_align_reset' | null {
     switch (code) {
       case 'invalid_model': {
         const prev = this.optimistic.model;
         this.optimistic.model = undefined;
-        if (prev === undefined) return;
+        if (prev === undefined) return null;
         this.deps.config.set('asr', { model: prev });
         this.deps.state.dispatch({ type: 'modelChanged', model: prev });
         break;
@@ -330,7 +396,7 @@ export class Controller {
       case 'invalid_language': {
         const prev = this.optimistic.activeLanguage;
         this.optimistic.activeLanguage = undefined;
-        if (prev === undefined) return;
+        if (prev === undefined) return null;
         const t = this.deps.config.get('translation');
         this.deps.config.set('translation', { ...t, activeLanguage: prev });
         this.deps.state.dispatch({ type: 'languageChanged', activeLanguage: prev });
@@ -339,14 +405,35 @@ export class Controller {
       case 'invalid_audio_source': {
         const prev = this.optimistic.audioSource;
         this.optimistic.audioSource = undefined;
-        if (prev === undefined) return;
-        this.deps.config.set('audio', { sourceId: prev });
-        this.deps.state.dispatch({ type: 'audioSourceChanged', audioSource: prev });
+        if (prev !== undefined) {
+          // 用户主动切换失败：回退原源（existing behavior）
+          this.deps.config.set('audio', { source: prev });
+          this.deps.state.dispatch({
+            type: 'audioSourceChanged', audioSource: audioSourceLabel(prev)
+          });
+          return null;
+        }
+        // 对齐路径失败（应用未运行等）：粘性回退默认设备，后续连接不再重试
+        const pending = this.pendingAlignSource;
+        this.pendingAlignSource = null;
+        if (pending === null) return null;
+        this.deps.config.set('audio', { source: { ...DEFAULT_AUDIO_SOURCE } });
+        this.deps.state.dispatch({ type: 'audioSourceChanged', audioSource: '' });
+        return 'audio_align_reset';
+      }
+      case 'invalid_llm':
+      case 'model_download_failed':
+      case 'llm_load_failed': {
+        const prev = this.optimistic.llm;
+        this.optimistic.llm = undefined;
+        if (prev === undefined) return null;
+        const t = this.deps.config.get('translation');
+        this.deps.config.set('translation', { ...t, model: prev });
         break;
       }
       case 'invalid_device': {
         const prev = this.optimistic.device;
-        if (prev === undefined) return;
+        if (prev === undefined) return null;
         const prevView = this.optimistic.deviceState ?? null;
         this.optimistic.device = undefined;
         this.optimistic.deviceState = undefined;
@@ -357,6 +444,7 @@ export class Controller {
       default:
         break;
     }
+    return null;
   }
 
   /** 字幕落库：静音自动切分 → 写入 → 首句改题时通知侧栏刷新 */
@@ -365,7 +453,7 @@ export class Controller {
     if (!h) return;
 
     const now = Date.now();
-    const audioSource = this.deps.config.get('audio').sourceId;
+    const audioSource = audioSourceLabel(this.deps.config.get('audio').source);
     const split = h.maybeAutoSplit(
       now, this.deps.config.get('sessions').autoSplitSilenceMin, audioSource
     );
@@ -411,4 +499,24 @@ export class Controller {
 
 function sameArray(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/** pipeline_warning 缺 message 时按 reason 兜底（主窗口 toast；细条文案见 OverlayApp） */
+function warningToastText(reason: string | undefined, message: string | undefined): string {
+  if (typeof message === 'string' && message.length > 0) return message;
+  switch (reason) {
+    case 'stalled':
+      return '识别引擎停滞，正在自动恢复…';
+    case 'engine_degraded':
+      return '识别引擎已降级运行（建议换更小的模型）';
+    default:
+      return '处理过载：已丢弃最旧语句（建议换更小的模型）';
+  }
+}
+
+/** detail 容错：非对象（含数组以外的非法值）一律丢弃 */
+function asDetail(raw: unknown): Record<string, unknown> | undefined {
+  return typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : undefined;
 }

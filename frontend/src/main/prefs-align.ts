@@ -4,9 +4,9 @@
  * Gateway 每次 WS 连接建立（含重连）后调用：
  * 1. 发送 config_sync（幂等）
  * 2. get_config 查询后端 ASR 模型，与 store 不一致时发 change_model
- * 3. 音频源：store 非空且"本后端会话内未应用过"时发一次 set_audio_source
- *    （get_config 不回传音频源，故用 AlignmentTracker 做会话级幂等；
- *      后端进程重启时由 BackendManager 调 markBackendRestarted 复位）
+ * 3. 音频源：get_config 回传结构化 audio.source 时比较（一致不发/不一致发）；
+ *    旧后端缺失该字段 → 用 AlignmentTracker 做"本后端会话内应用一次"的幂等
+ *    （后端进程重启时由 BackendManager 调 markBackendRestarted 复位）
  *
  * 纯 Node 模块：不 import electron，可独立单测。
  */
@@ -14,6 +14,7 @@ import type { Gateway } from './gateway';
 import type {
   DeviceEngineState, DeviceReason, DeviceResolved, DeviceStateView, GatewayLogger
 } from './types';
+import { audioSourceKey, audioSourceToTarget, sameAudioSource, type AudioSourcePref } from './config-migration';
 
 export type { DeviceStateView } from './types';
 
@@ -21,7 +22,10 @@ export interface PrefsSnapshot {
   targetLanguages: string[];
   activeLanguage: string;
   model: string;
-  audioSourceId: string; // '' = 默认设备
+  /** store 翻译模型偏好（llama.cpp 注册表 id，键 translation.model） */
+  translationModel: string;
+  /** 结构化音频源偏好（D9/D10）：设备源或按进程源 */
+  audioSource: AudioSourcePref;
   /** 推理设备偏好；auto 时以后端解析结果为准，不做设备对齐 */
   device: 'auto' | 'cpu' | 'cuda';
 }
@@ -34,8 +38,10 @@ export interface BackendConfigInfo {
     resolved_device?: unknown;
     device_reason?: unknown;
   };
-  translation?: { resolved_device?: unknown; device_reason?: unknown };
+  translation?: { model?: unknown; resolved_device?: unknown; device_reason?: unknown };
   active_language?: unknown;
+  /** 后端当前运行源（纯增量字段；旧后端缺失） */
+  audio?: { source?: unknown };
 }
 
 function asResolved(raw: unknown): DeviceResolved {
@@ -48,6 +54,7 @@ function asReason(raw: unknown): DeviceReason {
     case 'user':
     case 'no_cuda':
     case 'load_failed':
+    case 'runtime_failed':
       return raw;
     default:
       return 'auto';
@@ -86,20 +93,39 @@ function asDevicePreference(raw: unknown): 'auto' | 'cpu' | 'cuda' | null {
   return raw === 'auto' || raw === 'cpu' || raw === 'cuda' ? raw : null;
 }
 
+/**
+ * get_config 回传的 `audio.source` → 结构化源；缺失/形状非法 → null（旧后端）。
+ * 后端进程源使用 `pid`，store 进程源使用 `lastPid`，此处做映射。
+ */
+export function audioSourceFromConfig(raw: unknown): AudioSourcePref | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const rec = raw as Record<string, unknown>;
+  if (rec.kind === 'device' && typeof rec.id === 'string') {
+    return { kind: 'device', id: rec.id };
+  }
+  if (rec.kind === 'process' && typeof rec.name === 'string') {
+    return { kind: 'process', name: rec.name, lastPid: typeof rec.pid === 'number' ? rec.pid : null };
+  }
+  return null;
+}
+
 export class AlignmentTracker {
-  private appliedSourceId: string | null = null;
+  /** 已应用源的稳定键（device:<id> / process:<name>） */
+  private appliedKey: string | null = null;
 
   /** 后端进程重启后调用：音频源需重新应用 */
   markBackendRestarted(): void {
-    this.appliedSourceId = null;
+    this.appliedKey = null;
   }
 
-  markSourceApplied(id: string): void {
-    this.appliedSourceId = id;
+  markSourceApplied(source: AudioSourcePref): void {
+    this.appliedKey = audioSourceKey(source);
   }
 
-  needsSourceApply(id: string): boolean {
-    return id !== '' && id !== this.appliedSourceId;
+  /** 默认设备（device:''）永不主动发送；其余源按稳定键做会话级幂等 */
+  needsSourceApply(source: AudioSourcePref): boolean {
+    if (source.kind === 'device' && source.id === '') return false;
+    return audioSourceKey(source) !== this.appliedKey;
   }
 }
 
@@ -120,11 +146,25 @@ export async function alignPreferences(
   });
 
   let deviceView: DeviceStateView | null = null;
+  let info: BackendConfigInfo | null = null;
   try {
-    const info = await gw.request<BackendConfigInfo>('get_config');
+    info = await gw.request<BackendConfigInfo>('get_config');
     const backendModel = typeof info?.asr?.model_size === 'string' ? info.asr.model_size : null;
     if (backendModel !== null && backendModel !== prefs.model) {
       gw.send({ type: 'control', action: 'change_model', model_size: prefs.model });
+    }
+
+    // 翻译模型对齐（change_llm）：后端回传 translation.model 且与 store 不一致时下发；
+    // 旧后端缺该字段 → 容错跳过（避免误下发造成无谓重启）
+    const backendLlm = typeof info?.translation?.model === 'string'
+      ? info.translation.model
+      : null;
+    if (
+      backendLlm !== null
+      && prefs.translationModel !== ''
+      && backendLlm !== prefs.translationModel
+    ) {
+      gw.send({ type: 'control', action: 'change_llm', model_id: prefs.translationModel });
     }
 
     // 设备对齐：仅 store 显式值参与；后端偏好缺失（旧后端）时不发
@@ -138,11 +178,20 @@ export async function alignPreferences(
     logger.warn('get_config 失败，跳过模型与设备对齐', err);
   }
 
-  if (tracker.needsSourceApply(prefs.audioSourceId)) {
-    const ok = gw.send({
-      type: 'control', action: 'set_audio_source', source_id: prefs.audioSourceId
-    });
-    if (ok) tracker.markSourceApplied(prefs.audioSourceId);
+  // 音频源对齐（D9）：后端回传 audio.source 时比较结构化源（一致不发/不一致下发）；
+  // 旧后端缺失该字段 → 沿用 AlignmentTracker 的"本后端会话内应用一次"策略。
+  // 下发一律使用线上目标形状（进程源携带 pid；store 的 lastPid 缺省时不可下发）。
+  const target = audioSourceToTarget(prefs.audioSource);
+  const backendSource = audioSourceFromConfig(info?.audio?.source);
+  if (target === null) {
+    logger.warn('进程源缺少 PID，跳过音频源对齐', prefs.audioSource);
+  } else if (backendSource !== null) {
+    if (!sameAudioSource(prefs.audioSource, backendSource)) {
+      gw.send({ type: 'control', action: 'set_audio_source', source: target });
+    }
+  } else if (tracker.needsSourceApply(prefs.audioSource)) {
+    const ok = gw.send({ type: 'control', action: 'set_audio_source', source: target });
+    if (ok) tracker.markSourceApplied(prefs.audioSource);
   }
 
   return deviceView;

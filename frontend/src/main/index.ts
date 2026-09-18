@@ -19,6 +19,7 @@ import log from 'electron-log/main';
 import iconPngPath from '../../resources/icon.png?asset';
 
 import { ConfigStore } from './config';
+import { audioSourceLabel } from './config-migration';
 import { BackendManager } from './backend-manager';
 import { Gateway, GatewayError } from './gateway';
 import { createInitialState, StateStore } from './state';
@@ -350,8 +351,8 @@ function registerShortcuts(): void {
 
 const KNOWN_INTENTS = new Set<string>([
   'togglePause', 'cycleLanguage', 'cycleModel', 'setLanguage', 'setModel',
-  'toggleLock', 'toggleOverlay', 'setAudioSource', 'setDevice', 'newSession',
-  'showSettings', 'restartBackend'
+  'setLlm', 'toggleLock', 'toggleOverlay', 'setAudioSource', 'setDevice',
+  'newSession', 'showSettings', 'restartBackend'
 ]);
 
 function registerIpc(): void {
@@ -460,7 +461,7 @@ function registerIpc(): void {
       cfgPath.startsWith('translation')
       || cfgPath === 'asr.model'
       || cfgPath === 'inference.device'
-      || cfgPath === 'audio.sourceId'
+      || cfgPath === 'audio.source'
     ) {
       controller!.onConfigSaved();
     }
@@ -507,7 +508,9 @@ function registerIpc(): void {
     const r = history!.deleteSession(String(id));
     if (r.wasActive) {
       // 删除活跃会话 → 自动开启新会话（spec 场景）
-      const nid = history!.newSession(Date.now(), config!.get('audio').sourceId);
+      const nid = history!.newSession(
+        Date.now(), audioSourceLabel(config!.get('audio').source)
+      );
       state!.dispatch({ type: 'activeSessionChanged', id: nid });
     }
     broadcast('history:changed', { kind: 'session' });
@@ -522,7 +525,7 @@ function registerIpc(): void {
   ipcMain.handle('history:stats', () => history!.stats());
 
   ipcMain.handle('history:clear', () => {
-    history!.clearAll(Date.now(), config!.get('audio').sourceId);
+    history!.clearAll(Date.now(), audioSourceLabel(config!.get('audio').source));
     state!.dispatch({ type: 'activeSessionChanged', id: history!.getActiveId() });
     broadcast('history:changed', { kind: 'clear' });
     return history!.stats();
@@ -633,7 +636,7 @@ app.whenReady().then(() => {
     path.join(app.getPath('userData'), 'history.db'), logBridge
   );
   const activeSessionId = history.ensureActiveSession(
-    Date.now(), config.get('audio').sourceId
+    Date.now(), audioSourceLabel(config.get('audio').source)
   );
 
   // 3. 状态机（初值来自配置）
@@ -642,7 +645,7 @@ app.whenReady().then(() => {
     model: config.get('asr').model,
     activeLanguage: config.get('translation').activeLanguage,
     targetLanguages: config.get('translation').targetLanguages,
-    audioSource: config.get('audio').sourceId,
+    audioSource: audioSourceLabel(config.get('audio').source),
     locked: config.get('locked'),
     overlayVisible: true,
     activeSessionId
@@ -708,6 +711,14 @@ app.whenReady().then(() => {
 
   // 推理设备偏好变化 → 广播配置（设置页 Select 值取自 cfg.inference.device）
   config.onDidChange('inference', () => broadcastConfig());
+
+  // 音频源偏好变化 → 广播配置（设置页 Select 值与胶囊面板选中态取自 cfg.audio.source；
+  // 用户切换 / 退出回退 / 对齐重置均由 controller 直写 store，不广播则 UI 选中态不刷新）
+  config.onDidChange('audio', () => broadcastConfig());
+
+  // 翻译模型偏好变化 → 广播配置（设置页选择与失败回退写 store 后，UI 选中态需刷新；
+  // 与后端实际运行态的对齐经 change_llm 由 controller/prefs-align 下发）
+  config.onDidChange('translation', () => broadcastConfig());
 
   // 7. 自动更新（打包构建才启用；启动 15s 后静默检查）
   updater = new UpdaterService({

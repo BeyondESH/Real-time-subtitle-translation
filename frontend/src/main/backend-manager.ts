@@ -145,6 +145,11 @@ export class BackendManager {
       SUBTITLE_CONFIG_PATH: ensureConfigCopy(this.paths.userDataDir, template, this.logger)
     };
 
+    // llama.cpp sidecar 二进制目录（翻译引擎；打包=resources/llama，dev=repo vendor）
+    env.SUBTITLE_LLAMA_DIR = this.paths.isPackaged
+      ? path.join(this.paths.resourcesPath, 'llama')
+      : path.join(this.paths.devBackendDir, 'vendor', 'llama');
+
     // 显式设备偏好首载即生效（auto 不注入，尊重 config.yaml 手工配置）
     const device = this.getDevice();
     if (device !== 'auto') {

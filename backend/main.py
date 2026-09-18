@@ -22,10 +22,12 @@ from pathlib import Path
 
 import yaml
 
+import process_loopback
 from audio_buffer import RingBuffer, UtteranceSegmenter
 from audio_capture import AudioCapture
 from asr_engine import ASREngine
 from device_support import VALID_DEVICES
+from model_downloader import DownloadError
 from pipeline_worker import PipelineWorker
 from translator import Translator
 from vad_events import VadStateBroadcaster
@@ -87,6 +89,7 @@ class SubtitleTranslator:
         buffer_seconds = pipeline_cfg.get('buffer_seconds', 30)
         self._tick_interval = pipeline_cfg.get('tick_ms', 250) / 1000.0
         queue_size = pipeline_cfg.get('queue_size', 8)
+        stall_timeout_s = pipeline_cfg.get('stall_timeout_s', 30)
 
         # 组件
         self.audio_capture = AudioCapture(self.config)
@@ -103,7 +106,9 @@ class SubtitleTranslator:
         )
         self.worker = PipelineWorker(
             self.asr_engine, self.translator, self.websocket_server, queue_size,
-            get_active_language=lambda: self.active_target_language
+            get_active_language=lambda: self.active_target_language,
+            stall_timeout_s=stall_timeout_s,
+            on_stall=lambda: self.asr_engine.notify_stall(),
         )
 
         # VAD 状态翻转广播（speech 即时 / silence 去抖 300ms）
@@ -116,7 +121,17 @@ class SubtitleTranslator:
 
         # 注册 WebSocket 请求/响应方法（设置面板使用）
         self.websocket_server.register_method('get_audio_sources', self._method_get_audio_sources)
+        self.websocket_server.register_method('get_audio_processes', self._method_get_audio_processes)
         self.websocket_server.register_method('get_config', self._method_get_config)
+
+        # 进程源退出 → watchdog 线程回调 → 切回默认设备（事件循环内编排）
+        self.audio_capture.set_source_lost_callback(self._on_audio_source_lost)
+
+        # ASR 健康事件（运行期降级/持续失败）→ device_state 广播与告警
+        self.asr_engine.set_health_callback(self._on_asr_health)
+
+        # 翻译健康事件（运行期降级/持续失败）→ device_state 广播与告警
+        self.translator.set_health_callback(self._on_translation_health)
 
         self._running = False
         self._loop: asyncio.AbstractEventLoop = None
@@ -166,7 +181,8 @@ class SubtitleTranslator:
                 'buffer_seconds': 30,
                 'tick_ms': 250,
                 'max_utterance_s': 15,
-                'queue_size': 8
+                'queue_size': 8,
+                'stall_timeout_s': 30
             },
             'vad': {
                 'threshold': 0.5,
@@ -179,12 +195,13 @@ class SubtitleTranslator:
                 'language': None  # 自动检测
             },
             'translation': {
-                'primary_model': 'Helsinki-NLP/opus-mt-ja-zh',
-                'fallback_model': 'facebook/nllb-200-distilled-600M',
+                'default_model': 'hy-mt2-1.8b-q4km',
+                'models': [],
+                'download': {'source': 'auto'},
+                'n_ctx': 4096,
+                'timeout_s': 30,
                 'target_languages': ['zh', 'en'],
                 'device': 'auto',
-                'lazy_load': True,
-                'preload_primary': True
             },
             'websocket': {
                 'host': 'localhost',
@@ -237,10 +254,8 @@ class SubtitleTranslator:
         # ASR 初始化完成（含降级）即广播设备状态
         await self._broadcast_device_state()
 
-        # 后台预载日中主翻译模型（失败降级为纯懒加载）
-        translation_cfg = self.config.get('translation', {})
-        if translation_cfg.get('preload_primary', True):
-            self._preload_task = asyncio.create_task(self._preload_primary_model())
+        # 后台预载默认翻译模型（llama-server；模型缺失时先下载，失败不阻塞启动）
+        self._preload_task = asyncio.create_task(self._preload_default_model())
 
         # 启动管线工作器
         await self.worker.start()
@@ -253,18 +268,45 @@ class SubtitleTranslator:
 
         logger.info("服务启动完成")
 
-    async def _preload_primary_model(self):
-        """后台预载主翻译模型，失败时降级为懒加载；完成后广播设备状态"""
+    async def _preload_default_model(self):
+        """后台预载默认翻译模型（llama-server），失败转首次使用时重试；完成后广播设备状态"""
         try:
-            await self.translator.ensure_primary()
-            logger.info("主翻译模型后台预载完成")
+            await self.translator.ensure_default()
+            logger.info("默认翻译模型后台预载完成")
         except Exception as e:
-            logger.warning(f"主翻译模型预载失败，将在首次使用时重试: {e}")
+            logger.warning(f"默认翻译模型预载失败，将在首次使用时重试: {e}")
         await self._broadcast_device_state()
 
     def _on_audio_chunk(self, audio_data):
         """音频块回调（录音线程，同步，只写环形缓冲）"""
         self.ring_buffer.append(audio_data)
+
+    def _on_audio_source_lost(self, name, pid):
+        """watchdog 线程回调：切回主事件循环编排回退（不阻塞捕获路径）。"""
+        logger.warning(f"进程音频源退出: {name} (pid={pid})，回退默认设备")
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        loop.call_soon_threadsafe(self._schedule_source_lost, name, pid)
+
+    def _schedule_source_lost(self, name, pid):
+        """在主事件循环中调度回退处理。"""
+        asyncio.create_task(self._handle_source_lost(name, pid))
+
+    async def _handle_source_lost(self, name, pid):
+        """切回默认设备源 + 重启捕获 + 广播 audio_source_lost（事件驱动）。"""
+        try:
+            self.audio_capture.set_audio_source({'kind': 'device', 'id': ''})
+            await self.audio_capture.restart()
+        except Exception as e:  # noqa: BLE001 - 回退失败仍须告知前端
+            logger.error(f"回退默认音频源失败: {e}")
+        # 无客户端时 send 自动跳过（与既有广播一致）
+        await self.websocket_server.send({
+            'type': 'audio_source_lost',
+            'name': name,
+            'pid': pid,
+            'fallback': 'system'
+        })
 
     async def _segmentation_loop(self):
         """VAD 切句循环（事件循环线程）"""
@@ -308,6 +350,7 @@ class SubtitleTranslator:
 
         await self.audio_capture.stop()
         await self.worker.stop()
+        await self.translator.stop()  # 终止 llama-server，无残留进程
         await self.websocket_server.stop()
         logger.info("服务已停止")
 
@@ -315,12 +358,25 @@ class SubtitleTranslator:
         """WS 方法：枚举音频源"""
         return await asyncio.to_thread(self.audio_capture.get_audio_sources)
 
+    async def _method_get_audio_processes(self, _params):
+        """WS 方法：枚举可捕获的应用进程（音量合成器口径）"""
+        if not process_loopback.supported():
+            return {'supported': False, 'reason': 'os_too_old', 'processes': []}
+        try:
+            processes = await asyncio.to_thread(process_loopback.list_audio_processes)
+        except process_loopback.ProcessLoopbackError as e:
+            logger.warning(f"音频进程枚举失败: {e}")
+            # 走既有请求错误机制（响应 ok=false, error=...）；code 以字符串前缀表达
+            raise RuntimeError(f'enumerate_failed: {e}') from e
+        return {'supported': True, 'reason': None, 'processes': processes}
+
     async def _method_get_config(self, _params):
-        """WS 方法：返回后端运行配置摘要（含两引擎实际设备与原因）"""
+        """WS 方法：返回后端运行配置摘要（含两引擎实际设备、原因与当前音频源）"""
         return {
             'asr': self.asr_engine.get_model_info(),
             'translation': self.translator.get_model_info(),
             'active_language': self.active_target_language,
+            'audio': {'source': self.audio_capture.get_current_source()},
         }
 
     async def _broadcast_device_state(self):
@@ -336,6 +392,106 @@ class SubtitleTranslator:
                 'reason': self.translator.device_reason,
             },
         })
+
+    # ------------------------------------------------------------------ #
+    # ASR 健康事件：运行期降级 → 设备状态广播 + engine_degraded 告警
+    # ------------------------------------------------------------------ #
+
+    # 重档模型集：CPU 上难以实时，降级时提示用户降档
+    _HEAVY_MODELS = ('medium', 'large-v3')
+
+    def _on_asr_health(self, payload: dict):
+        """ASR 健康回调（事件循环上下文）：调度到主事件循环处理。"""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        loop.call_soon_threadsafe(self._schedule_asr_health, payload)
+
+    def _schedule_asr_health(self, payload: dict):
+        """在主事件循环中调度健康事件处理。"""
+        asyncio.create_task(self._handle_asr_health(payload))
+
+    async def _handle_asr_health(self, payload: dict):
+        """运行期降级：广播设备状态与 engine_degraded；持续失败：仅告警。"""
+        event = payload.get('event')
+        if event == 'runtime_degraded':
+            await self._broadcast_device_state()
+            model_size = payload.get('model_size') or self.asr_engine.model_size
+            message = 'GPU 运行时不可用，已自动回退 CPU（原因：运行时推理失败）'
+            if model_size in self._HEAVY_MODELS:
+                message += (
+                    f'；当前模型 {model_size} 在 CPU 上难以实时，'
+                    '建议切换到 base/small'
+                )
+            await self.websocket_server.send({
+                'type': 'pipeline_warning',
+                'reason': 'engine_degraded',
+                'dropped': self.worker.dropped_count,
+                'message': message,
+                'detail': {
+                    'engine': 'asr',
+                    'from': 'cuda',
+                    'to': 'cpu',
+                    'device_reason': 'runtime_failed',
+                },
+            })
+        elif event == 'persistent_failure':
+            await self.websocket_server.send({
+                'type': 'pipeline_warning',
+                'reason': 'engine_degraded',
+                'dropped': self.worker.dropped_count,
+                'message': '识别引擎持续失败（CPU），请检查日志',
+                'detail': {
+                    'engine': 'asr',
+                    'failures': payload.get('failures'),
+                    'last_error': payload.get('last_error'),
+                },
+            })
+
+    # ------------------------------------------------------------------ #
+    # 翻译健康事件：运行期降级 → 设备状态广播 + engine_degraded 告警
+    # ------------------------------------------------------------------ #
+
+    def _on_translation_health(self, payload: dict):
+        """翻译健康回调（事件循环上下文）：调度到主事件循环处理。"""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        loop.call_soon_threadsafe(self._schedule_translation_health, payload)
+
+    def _schedule_translation_health(self, payload: dict):
+        """在主事件循环中调度健康事件处理。"""
+        asyncio.create_task(self._handle_translation_health(payload))
+
+    async def _handle_translation_health(self, payload: dict):
+        """运行期降级：广播设备状态与 engine_degraded；持续失败：仅告警。"""
+        event = payload.get('event')
+        if event == 'runtime_degraded':
+            await self._broadcast_device_state()
+            await self.websocket_server.send({
+                'type': 'pipeline_warning',
+                'reason': 'engine_degraded',
+                'dropped': self.worker.dropped_count,
+                'message': '翻译引擎 GPU 运行时不可用，已自动回退 CPU（原因：运行时推理失败）',
+                'detail': {
+                    'engine': 'translation',
+                    'from': 'cuda',
+                    'to': 'cpu',
+                    'device_reason': 'runtime_failed',
+                },
+            })
+        elif event == 'persistent_failure':
+            await self.websocket_server.send({
+                'type': 'pipeline_warning',
+                'reason': 'engine_degraded',
+                'dropped': self.worker.dropped_count,
+                'message': '翻译引擎持续失败，请检查日志',
+                'detail': {
+                    'engine': 'translation',
+                    'failures': payload.get('failures'),
+                    'last_error': payload.get('last_error'),
+                },
+            })
 
     async def _on_control_message(self, message: dict):
         """处理来自前端的控制/同步消息"""
@@ -377,9 +533,15 @@ class SubtitleTranslator:
                     'message': f'语言 {language} 不在目标列表: {self.translator.target_languages}'
                 })
         elif action == 'set_audio_source':
-            source_id = message.get('source_id')
+            # 新格式优先；旧格式 source_id（裸设备 id，''=默认）向后兼容
+            if message.get('source') is not None:
+                source = message.get('source')
+            elif 'source_id' in message:
+                source = message.get('source_id')
+            else:
+                source = None
             try:
-                self.audio_capture.set_audio_source(source_id)
+                self.audio_capture.set_audio_source(source)
                 await self.audio_capture.restart()
             except (ValueError, RuntimeError) as e:
                 logger.warning(f"切换音频源失败: {e}")
@@ -388,6 +550,8 @@ class SubtitleTranslator:
                     'code': 'invalid_audio_source',
                     'message': str(e)
                 })
+                return
+            logger.info(f"音频源已切换: {self.audio_capture.get_current_source()}")
         elif action == 'change_model':
             model_size = message.get('model_size', 'base')
             try:
@@ -399,6 +563,36 @@ class SubtitleTranslator:
                     'code': 'invalid_model',
                     'message': str(e)
                 })
+        elif action == 'change_llm':
+            model_id = message.get('model_id')
+            try:
+                await self.translator.change_llm(model_id)
+            except ValueError as e:
+                logger.warning(f"切换翻译模型失败: {e}")
+                await self.websocket_server.send({
+                    'type': 'error',
+                    'code': 'invalid_llm',
+                    'message': str(e)
+                })
+                return
+            except DownloadError as e:
+                logger.error(f"翻译模型下载失败: {e}")
+                await self.websocket_server.send({
+                    'type': 'error',
+                    'code': 'model_download_failed',
+                    'message': str(e)
+                })
+                return
+            except Exception as e:  # noqa: BLE001 - 不得冒泡到连接级 catch 导致断连
+                logger.error(f"切换翻译模型失败: {e}", exc_info=True)
+                await self.websocket_server.send({
+                    'type': 'error',
+                    'code': 'llm_load_failed',
+                    'message': str(e)
+                })
+                return
+            # 成功后设备可能因静默降级变化，广播实际状态
+            await self._broadcast_device_state()
         elif action == 'change_device':
             device = message.get('device')
             if device not in VALID_DEVICES:

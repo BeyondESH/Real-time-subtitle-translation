@@ -5,6 +5,21 @@ import {
   Button, Modal, Pill, ProgressBar, SegmentedNav, Select, Slider, StatusDot, Toggle
 } from '../components/ui';
 import { useAppConfig, useAppState, useEnv } from '../state/hooks';
+import {
+  AUDIO_APPS_EMPTY_HINT,
+  AUDIO_APPS_UNSUPPORTED_HINT,
+  buildAudioSelectModel,
+  buildAudioSourceList,
+  decodeAudioSource,
+  fetchAudioSources,
+  type AudioSourcesData
+} from '../state/audio-sources';
+import {
+  buildTranslationSelectOptions,
+  fetchTranslationModels,
+  translationModelStatusText,
+  type TranslationModelsData
+} from '../state/translation-models';
 import { ToastHost } from './ToastHost';
 
 const SECTIONS = [
@@ -57,9 +72,27 @@ export function deviceStatusText(device: AppStateView['device'] | undefined): st
       return 'CPU（未检测到兼容的 CUDA 环境）';
     case 'load_failed':
       return 'CPU（GPU 加载失败，已自动降级）';
+    case 'runtime_failed':
+      return 'CPU（GPU 运行时不可用，已自动降级）';
     default:
       return 'CPU（用户指定）';
   }
+}
+
+/** 重档模型集（design D6）：实际 CPU 时提示降档，仅展示不代选 */
+const HEAVY_MODELS = new Set(['medium', 'large-v3']);
+
+/**
+ * 实际设备为 CPU 且 ASR 模型为重档 → 降档建议文案（settings-management spec）；
+ * 仅作提示，MUST NOT 自动更改用户模型选择（design D6）。
+ */
+export function deviceModelAdvice(
+  device: AppStateView['device'] | undefined,
+  model: string | undefined
+): string | null {
+  if (!device || device.asr.resolved !== 'cpu') return null;
+  if (!model || !HEAVY_MODELS.has(model)) return null;
+  return '当前模型在 CPU 上难以实时，建议切换到更小模型档位';
 }
 
 const THEME_ITEMS = [
@@ -96,7 +129,7 @@ export function SettingsPage() {
       <div className="min-w-0 flex-1 overflow-y-auto px-8 py-6">
         {current === 'general' && <GeneralSection cfg={cfg} />}
         {current === 'subtitle' && <SubtitleSection cfg={cfg} supportsAcrylic={env?.supportsAcrylic ?? false} />}
-        {current === 'audio' && <AudioSection state={state} />}
+        {current === 'audio' && <AudioSection cfg={cfg} />}
         {current === 'model' && <ModelSection state={state} cfg={cfg} />}
         {current === 'shortcuts' && <ShortcutsSection cfg={cfg} />}
         {current === 'advanced' && <AdvancedSection version={env?.version ?? ''} />}
@@ -367,56 +400,56 @@ function ColorInput({ value, onChange }: { value: string; onChange(v: string): v
 
 // ---------- 音频 ----------
 
-interface AudioSource {
-  id: string;
-  name: string;
-  is_loopback?: boolean;
-}
-
-function AudioSection({ state }: { state: AppStateView | null }) {
-  const [devices, setDevices] = useState<AudioSource[] | null>(null);
-  const [status, setStatus] = useState<'idle' | 'loading' | 'error'>('idle');
+/** 音频分段：设备 + 应用进程同源列表（add-per-process-audio-capture settings-management 增量） */
+export function AudioSection({ cfg }: { cfg: AppConfigView }) {
+  const [data, setData] = useState<AudioSourcesData | null>(null);
+  const [status, setStatus] = useState<'idle' | 'loading' | 'error'>('loading');
   const [errorText, setErrorText] = useState('');
 
   const load = (): void => {
     setStatus('loading');
-    window.appAPI
-      .wsRequest('get_audio_sources')
-      .then((resp) => {
-        if (!resp.ok) {
-          setStatus('error');
-          setErrorText(resp.error === 'not_connected'
-            ? '后端未连接'
-            : resp.error === 'timeout'
-              ? '拉取超时，请确认后端已启动'
-              : `拉取失败: ${resp.message}`);
-          setDevices(null);
-          return;
-        }
-        const list = resp.result as AudioSource[];
-        setDevices(list.filter((s) => s.is_loopback !== false));
+    fetchAudioSources()
+      .then((d) => {
+        setData(d);
         setStatus('idle');
       })
       .catch((e: unknown) => {
-        setStatus('error');
+        setData(null);
         setErrorText(String(e));
+        setStatus('error');
       });
   };
+
+  // 打开分段即拉取一次（settings-management spec：实时拉取）
+  useEffect(() => {
+    load();
+  }, []);
+
+  const list = data ? buildAudioSourceList(data) : null;
+  const model = list ? buildAudioSelectModel(list, cfg.audio.source) : null;
+
+  const onChange = (value: string): void => {
+    const source = decodeAudioSource(value);
+    if (source) void window.appAPI.dispatch({ type: 'setAudioSource', source });
+  };
+
+  const retry = (
+    <button type="button" className="ml-2 underline" onClick={load}>
+      重试
+    </button>
+  );
 
   return (
     <div className="max-w-xl">
       <SectionTitle>音频</SectionTitle>
-      <Row label="音频源（回环设备）">
+      <Row label="音频源">
         <span className="flex w-full items-center gap-2">
           <span className="min-w-0 flex-1">
             <Select
-              options={[
-                { value: '', label: '默认回环设备' },
-                ...(devices ?? []).map((d) => ({ value: d.id, label: d.name }))
-              ]}
-              value={state?.audioSource ?? ''}
-              onChange={(v) => void window.appAPI.dispatch({ type: 'setAudioSource', id: v })}
-              disabled={status === 'error'}
+              options={model?.options ?? []}
+              value={model?.value ?? ''}
+              onChange={onChange}
+              disabled={status !== 'idle' || model === null}
             />
           </span>
           <Button
@@ -430,19 +463,31 @@ function AudioSection({ state }: { state: AppStateView | null }) {
         </span>
       </Row>
       {status === 'loading' && <p className="text-xs text-secondary">加载中…</p>}
-      {status === 'error' && (
-        <p className="text-xs text-danger">
-          {errorText}
-          <button type="button" className="ml-2 underline" onClick={load}>
-            重试
-          </button>
-        </p>
+      {status === 'error' && <p className="text-xs text-danger">{errorText}{retry}</p>}
+      {status === 'idle' && data && list && (
+        <>
+          {data.deviceError && (
+            <p className="text-xs text-danger">设备列表：{data.deviceError}{retry}</p>
+          )}
+          {data.processError && (
+            <p className="text-xs text-danger">应用列表：{data.processError}{retry}</p>
+          )}
+          {!data.deviceError && !data.processError && (
+            <p className="text-xs text-secondary">
+              发现 {list.devices.length} 个回环设备
+              {list.appsSupported ? `，${list.apps.length} 个应用进程` : ''}
+            </p>
+          )}
+          {!data.processError && !list.appsSupported && (
+            <p className="mt-1 text-xs text-secondary opacity-60">{AUDIO_APPS_UNSUPPORTED_HINT}</p>
+          )}
+          {!data.processError && list.appsSupported && list.apps.length === 0 && (
+            <p className="mt-1 text-xs text-secondary opacity-60">{AUDIO_APPS_EMPTY_HINT}</p>
+          )}
+        </>
       )}
-      {status === 'idle' && devices && (
-        <p className="text-xs text-secondary">发现 {devices.length} 个回环设备</p>
-      )}
-      {status === 'idle' && !devices && (
-        <p className="text-xs text-secondary opacity-60">点击"刷新"从后端拉取设备列表</p>
+      {status === 'idle' && !data && (
+        <p className="text-xs text-secondary opacity-60">点击"刷新"从后端拉取设备与应用列表</p>
       )}
     </div>
   );
@@ -450,8 +495,55 @@ function AudioSection({ state }: { state: AppStateView | null }) {
 
 // ---------- 模型 ----------
 
+/**
+ * 翻译模型区块（settings-management spec「翻译模型设置与状态显示」）：
+ * 当前实际模型 + 注册表可选模型（体积/下载状态）；选择即派发 changeLlm Intent；
+ * 失败回退与错误提示由 Controller 的乐观回退链路负责。
+ */
+export function TranslationModelRow({ cfg }: { cfg: AppConfigView }) {
+  const [data, setData] = useState<TranslationModelsData | null>(null);
+  const [status, setStatus] = useState<'loading' | 'idle' | 'error'>('loading');
+  const storeModel = cfg.translation.model;
+
+  useEffect(() => {
+    setStatus('loading');
+    fetchTranslationModels()
+      .then((d) => {
+        setData(d);
+        setStatus('idle');
+      })
+      .catch(() => {
+        setData(null);
+        setStatus('error');
+      });
+  }, []);
+
+  return (
+    <>
+      <Row label="翻译模型">
+        <span className="w-56">
+          <Select
+            options={buildTranslationSelectOptions(data, storeModel)}
+            value={storeModel}
+            onChange={(v) => void window.appAPI.dispatch({ type: 'setLlm', modelId: v })}
+          />
+        </span>
+      </Row>
+      <p className="mb-5 -mt-3 text-xs text-secondary">
+        {status === 'error'
+          ? '翻译模型信息拉取失败（后端未连接）'
+          : translationModelStatusText(data, storeModel)}
+      </p>
+      <p className="mb-5 text-xs text-secondary opacity-60">
+        切换立即生效；未下载的模型首次使用会自动下载，进度见下方。
+      </p>
+    </>
+  );
+}
+
 export function ModelSection({ state, cfg }: { state: AppStateView | null; cfg: AppConfigView }) {
   const device = cfg.inference?.device ?? 'auto';
+  const advice = deviceModelAdvice(state?.device, state?.model);
   return (
     <div className="max-w-xl">
       <SectionTitle>模型</SectionTitle>
@@ -467,6 +559,7 @@ export function ModelSection({ state, cfg }: { state: AppStateView | null; cfg: 
       <p className="mb-5 text-xs text-secondary opacity-60">
         切换立即生效；首次使用某档位会自动下载（约 40MB~1.5GB），进度见下方与直播流页。
       </p>
+      <TranslationModelRow cfg={cfg} />
       <Row label="推理设备">
         <span className="w-56">
           <Select
@@ -479,6 +572,11 @@ export function ModelSection({ state, cfg }: { state: AppStateView | null; cfg: 
       <p className="mb-5 -mt-3 text-xs text-secondary">
         当前使用：{deviceStatusText(state?.device)}
       </p>
+      {advice && (
+        <p className="mb-5 -mt-3 text-xs text-warn">
+          {advice}
+        </p>
+      )}
       <p className="mb-5 text-xs text-secondary opacity-60">
         切换设备将重新加载模型，期间字幕可能短暂延迟。
       </p>

@@ -12,8 +12,6 @@ audio:
   channels: 1
   # 音频块大小
   chunk_size: 1024
-  # 音频源选择 (null=默认回环设备)
-  source_app: null
 
 # 管线设置
 pipeline:
@@ -25,6 +23,8 @@ pipeline:
   max_utterance_s: 15
   # 语句队列深度（满时丢最旧并告警）
   queue_size: 8
+  # 管线停滞判定阈值（秒）：队列有待处理且超过该时长无处理进度时判停滞并自动恢复
+  stall_timeout_s: 30
 
 # VAD 设置 (faster-whisper 内置 Silero VAD)
 vad:
@@ -46,22 +46,25 @@ asr:
   # 计算类型: float16, int8_float16, int8
   compute_type: float16
 
-# 翻译设置
+# 翻译设置（llama.cpp / llama-server sidecar）
 translation:
-  # 日中专用模型
-  primary_model: Helsinki-NLP/opus-mt-ja-zh
-  # 全语种模型
-  fallback_model: facebook/nllb-200-distilled-600M
+  # 默认翻译模型（随包注册表 id；首次使用时自动下载，进度经 model_progress 广播）
+  default_model: hy-mt2-1.8b-q4km
+  # 可选：注册表增补条目（同构：id/display_name/repo/revision/filename/size_bytes/sha256/license/profile）
+  models: []
+  # 模型下载源: auto（官方→镜像→ModelScope 自动切换）, huggingface, hf-mirror, modelscope
+  download:
+    source: auto
+  # 上下文长度（llama-server -c）
+  n_ctx: 4096
+  # 单次翻译请求超时（秒）
+  timeout_s: 30
   # 目标语言列表
   target_languages:
     - zh  # 中文
     - en  # 英文
-  # 翻译设备: auto, cpu, cuda
+  # 翻译设备: auto, cpu, cuda（auto=检测到 CUDA 即用 GPU，拉起失败静默降级 CPU）
   device: auto
-  # NLLB 是否按需懒加载（首次用到才加载）
-  lazy_load: true
-  # 启动后是否后台预载日中主模型
-  preload_primary: true
 
 # WebSocket 设置
 websocket:

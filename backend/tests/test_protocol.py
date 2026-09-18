@@ -4,8 +4,10 @@ WebSocket 请求/响应协议与激活语言控制测试
 import asyncio
 import json
 import logging
+import types
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 import websockets
 
@@ -13,7 +15,9 @@ import asr_engine as asr_mod
 import translator as tr_mod
 from asr_engine import ASREngine
 from main import SubtitleTranslator
+from model_downloader import DownloadError
 from pipeline_worker import PipelineWorker
+from translation_models import model_path
 from translator import Translator
 from websocket_server import WebSocketServer
 
@@ -173,6 +177,17 @@ def _probe(cuda_available: bool, detail: str = 'test-probe') -> dict:
     return {'cuda_available': cuda_available, 'source': 'fake', 'detail': detail}
 
 
+def _fake_whisper_model():
+    """假模型：满足端到端热身验证的最小契约（transcribe → 空片段 + info）"""
+    info = types.SimpleNamespace(language='en', language_probability=1.0)
+
+    class _FakeModel:
+        def transcribe(self, audio, **kwargs):
+            return iter(()), info
+
+    return _FakeModel()
+
+
 class TestASREngineDevice:
     """ASR 统一加载路径 + change_device（假加载器，无网络）"""
 
@@ -186,7 +201,7 @@ class TestASREngineDevice:
                 raise RuntimeError(
                     'CUDA failed with error no CUDA-capable device is detected'
                 )
-            return object()
+            return _fake_whisper_model()
 
         monkeypatch.setattr(asr_mod, 'WhisperModel', fake_model)
         monkeypatch.setattr(
@@ -287,96 +302,118 @@ class TestASREngineDevice:
         assert 'resolved_device' in info and 'device_reason' in info
 
 
-class TestTranslatorDevice:
-    """翻译设备解析 + change_device（假探针/假加载，无网络）"""
+class _FakeLlamaManager:
+    """test_protocol 用最小 llama-server 管理器替身"""
 
-    def make_translator(self, monkeypatch, cuda_available):
+    def __init__(self):
+        self.starts = []
+        self.stop_calls = 0
+        self.is_running = False
+        self.is_ready = False
+        self.port = 18081
+        self.model_path = None
+
+    async def start(self, config):
+        self.starts.append(config)
+        self.model_path = config.model_path
+        self.is_running = True
+        self.is_ready = True
+
+    async def stop(self):
+        self.stop_calls += 1
+        self.is_running = False
+        self.is_ready = False
+        self.model_path = None
+
+
+class TestTranslatorDevice:
+    """翻译设备解析 + change_device（假探针/假管理器/假请求，无网络/无进程）"""
+
+    def make_translator(self, monkeypatch, tmp_path, cuda_available, *, device='auto'):
         monkeypatch.setattr(
             tr_mod, 'probe_compute',
             lambda: {'translation': _probe(cuda_available)},
         )
-        return Translator({
-            'translation': {
-                'device': 'auto', 'lazy_load': True, 'preload_primary': True
-            }
-        })
+        monkeypatch.setattr(
+            tr_mod, 'is_downloaded', lambda model, cache_root=None: True
+        )
+        exe = tmp_path / 'llama-server.exe'
+        exe.write_bytes(b'stub')
+        monkeypatch.setattr(tr_mod, 'resolve_device_binary', lambda root, dev: exe)
 
-    async def test_initialize_resolves_cpu_no_cuda(self, monkeypatch):
-        tr = self.make_translator(monkeypatch, cuda_available=False)
+        def handler(request):
+            return httpx.Response(200, json={
+                'choices': [{'message': {'content': 'ok'}, 'finish_reason': 'stop'}]
+            })
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = _FakeLlamaManager()
+        translator = Translator(
+            {'translation': {'device': device, 'target_languages': ['zh']}},
+            manager=manager, client=client, cache_root=tmp_path,
+        )
+        return translator, manager
+
+    def mark_loaded(self, translator, manager, tmp_path):
+        """模拟 llama-server 已拉起"""
+        manager.is_running = True
+        manager.is_ready = True
+        manager.model_path = model_path(translator._model, tmp_path)
+
+    async def test_initialize_resolves_cpu_no_cuda(self, monkeypatch, tmp_path):
+        tr, mgr = self.make_translator(monkeypatch, tmp_path, cuda_available=False)
         await tr.initialize()
         assert tr.device == 'auto'  # 偏好保持
         assert tr.resolved_device == 'cpu'
         assert tr.device_reason == 'no_cuda'
+        assert mgr.starts == []  # 拉起由后台预载负责
 
-    async def test_initialize_resolves_cuda_auto(self, monkeypatch):
-        tr = self.make_translator(monkeypatch, cuda_available=True)
+    async def test_initialize_resolves_cuda_auto(self, monkeypatch, tmp_path):
+        tr, mgr = self.make_translator(monkeypatch, tmp_path, cuda_available=True)
         await tr.initialize()
         assert tr.resolved_device == 'cuda'
         assert tr.device_reason == 'auto'
 
-    async def test_get_model_info_adds_fields(self, monkeypatch):
-        tr = self.make_translator(monkeypatch, cuda_available=False)
+    def test_get_model_info_adds_fields(self, monkeypatch, tmp_path):
+        tr, mgr = self.make_translator(monkeypatch, tmp_path, cuda_available=False)
         info = tr.get_model_info()
         assert info['device'] == 'auto'
         assert info['resolved_device'] is None
         assert info['device_reason'] is None
+        assert 'resolved_device' in info and 'device_reason' in info
 
-    async def test_change_device_invalid_raises(self, monkeypatch):
-        tr = self.make_translator(monkeypatch, cuda_available=False)
+    async def test_change_device_invalid_raises(self, monkeypatch, tmp_path):
+        tr, mgr = self.make_translator(monkeypatch, tmp_path, cuda_available=False)
         with pytest.raises(ValueError):
             await tr.change_device('tpu')
 
-    async def test_change_device_same_value_idempotent(self, monkeypatch):
-        tr = self.make_translator(monkeypatch, cuda_available=False)
+    async def test_change_device_same_value_idempotent(self, monkeypatch, tmp_path):
+        tr, mgr = self.make_translator(monkeypatch, tmp_path, cuda_available=False)
         await tr.initialize()
-        tr._primary_model = object()  # 已加载
+        self.mark_loaded(tr, mgr, tmp_path)
         await tr.change_device('auto')
-        assert tr._primary_model is not None  # 未卸载
+        assert mgr.stop_calls == 0  # 未终止
+        assert tr.is_ready is True  # 未卸载
 
-    async def test_change_device_resets_and_reloads_primary(self, monkeypatch):
-        tr = self.make_translator(monkeypatch, cuda_available=False)
+    async def test_change_device_resets_and_restarts(self, monkeypatch, tmp_path):
+        tr, mgr = self.make_translator(monkeypatch, tmp_path, cuda_available=False)
         await tr.initialize()
-        tr._primary_model = object()
-        tr._primary_tokenizer = object()
-        tr._fallback_model = object()
-        tr._fallback_tokenizer = object()
+        self.mark_loaded(tr, mgr, tmp_path)
 
-        reloaded = []
-
-        async def fake_ensure_primary():
-            reloaded.append(tr.resolved_device)
-            tr._primary_model = object()
-
-        tr.ensure_primary = fake_ensure_primary
-
-        await tr.change_device('cuda')  # 探针不可用 → cpu/no_cuda
+        await tr.change_device('cuda')  # 探针不可用 → cpu/no_cuda；已加载 → 重新拉起
 
         assert tr.device == 'cuda'
         assert tr.resolved_device == 'cpu'
         assert tr.device_reason == 'no_cuda'
-        assert tr._primary_model is None  # 已卸载
-        assert tr._fallback_model is None  # NLLB 一并卸载
+        assert mgr.stop_calls == 1
+        assert mgr.starts and mgr.starts[-1].n_gpu_layers == 0  # CPU 构建
 
-        for _ in range(10):
-            if reloaded:
-                break
-            await asyncio.sleep(0)
-        assert reloaded == ['cpu']  # 后台按新设备重新预载
-
-    async def test_change_device_unloaded_primary_not_reloaded(self, monkeypatch):
-        tr = self.make_translator(monkeypatch, cuda_available=False)
+    async def test_change_device_unloaded_not_reloaded(self, monkeypatch, tmp_path):
+        tr, mgr = self.make_translator(monkeypatch, tmp_path, cuda_available=False)
         await tr.initialize()
-        calls = []
-
-        async def fake_ensure_primary():
-            calls.append(1)
-
-        tr.ensure_primary = fake_ensure_primary
         await tr.change_device('cuda')
-
-        for _ in range(5):
-            await asyncio.sleep(0)
-        assert calls == []  # 切换前未加载 → 不后台预载
+        assert tr.resolved_device == 'cpu'
+        assert mgr.starts == []  # 切换前未加载 → 不后台重拉
 
 
 class TestDeviceControl:
@@ -494,28 +531,41 @@ class TestDeviceControl:
         assert 'resolved_device' in result['translation']
         assert 'device_reason' in result['translation']
 
+    async def test_get_config_translation_registry_fields(self):
+        app = self.make_app()
+        result = await app._method_get_config(None)
+        tr = result['translation']
+        assert tr['model'] == 'hy-mt2-1.8b-q4km'
+        assert [m['id'] for m in tr['available_models']]
+        assert 'target_languages' in tr
+        # NLLB 旧字段不得再出现
+        assert 'primary_model' not in tr
+        assert 'fallback_model' not in tr
+        assert 'nllb_loaded' not in tr
+        assert 'nllb_languages' not in tr
+
     async def test_broadcast_with_no_clients_is_safe(self):
         """真实 WebSocketServer 无客户端时广播 MUST NOT 抛异常"""
         app = SubtitleTranslator(config_path='nonexistent-config.yaml')
         await app._broadcast_device_state()
         assert app.websocket_server.get_client_count() == 0
 
-    async def test_preload_primary_broadcasts_device_state(self):
+    async def test_preload_default_broadcasts_device_state(self):
         app = self.make_app()
-        app.translator.ensure_primary = AsyncMock()
+        app.translator.ensure_default = AsyncMock()
         app.translator._resolved_device = 'cpu'
         app.translator._device_reason = 'no_cuda'
 
-        await app._preload_primary_model()
+        await app._preload_default_model()
 
         types = [m.get('type') for m in self.sent(app)]
         assert 'device_state' in types
 
     async def test_preload_failure_still_broadcasts_and_does_not_raise(self):
         app = self.make_app()
-        app.translator.ensure_primary = AsyncMock(side_effect=RuntimeError('net down'))
+        app.translator.ensure_default = AsyncMock(side_effect=RuntimeError('net down'))
 
-        await app._preload_primary_model()  # MUST NOT raise
+        await app._preload_default_model()  # MUST NOT raise
 
         types = [m.get('type') for m in self.sent(app)]
         assert 'device_state' in types
@@ -527,20 +577,198 @@ class TestDeviceControl:
         app.asr_engine._resolved_device = 'cpu'
         app.asr_engine._device_reason = 'no_cuda'
         app.translator.initialize = AsyncMock()
+        app.translator.ensure_default = AsyncMock()
         app.translator._resolved_device = 'cpu'
         app.translator._device_reason = 'no_cuda'
-        app.config['translation']['preload_primary'] = False
         app.worker.start = AsyncMock()
         app.audio_capture.start = AsyncMock()
         app._segmentation_loop = AsyncMock()
 
         await app.start()
         try:
+            if app._preload_task is not None:
+                await app._preload_task
             states = [m for m in self.sent(app) if m.get('type') == 'device_state']
-            assert len(states) == 1
+            assert states
             assert states[0]['asr'] == {'resolved': 'cpu', 'reason': 'no_cuda'}
         finally:
             await app.stop()
+
+    async def test_runtime_degraded_broadcasts_state_and_warning(self):
+        """运行期降级（runtime_failed）→ device_state + engine_degraded 告警（含降档建议）"""
+        app = self.make_app()
+        app.asr_engine._resolved_device = 'cpu'
+        app.asr_engine._device_reason = 'runtime_failed'
+        app.asr_engine.model_size = 'large-v3'
+
+        await app._handle_asr_health({
+            'event': 'runtime_degraded',
+            'resolved': 'cpu',
+            'reason': 'runtime_failed',
+            'model_size': 'large-v3',
+        })
+
+        msgs = self.sent(app)
+        states = [m for m in msgs if m.get('type') == 'device_state']
+        assert len(states) == 1
+        assert states[0]['asr'] == {'resolved': 'cpu', 'reason': 'runtime_failed'}
+
+        warnings = [m for m in msgs if m.get('type') == 'pipeline_warning']
+        assert len(warnings) == 1
+        assert warnings[0]['reason'] == 'engine_degraded'
+        assert warnings[0]['detail'] == {
+            'engine': 'asr', 'from': 'cuda', 'to': 'cpu',
+            'device_reason': 'runtime_failed',
+        }
+        assert '建议切换到 base/small' in warnings[0]['message']
+        assert 'dropped' in warnings[0]
+
+    async def test_runtime_degraded_light_model_has_no_suggestion(self):
+        """非重档模型不附加降档建议"""
+        app = self.make_app()
+        app.asr_engine._resolved_device = 'cpu'
+        app.asr_engine._device_reason = 'runtime_failed'
+
+        await app._handle_asr_health({
+            'event': 'runtime_degraded',
+            'resolved': 'cpu',
+            'reason': 'runtime_failed',
+            'model_size': 'base',
+        })
+
+        warnings = [
+            m for m in self.sent(app) if m.get('type') == 'pipeline_warning'
+        ]
+        assert len(warnings) == 1
+        assert '建议切换' not in warnings[0]['message']
+
+    async def test_persistent_failure_warning_payload(self):
+        """CPU 持续失败 → 仅 engine_degraded 告警，无 device_state"""
+        app = self.make_app()
+        await app._handle_asr_health({
+            'event': 'persistent_failure',
+            'failures': 3,
+            'last_error': 'boom',
+        })
+
+        msgs = self.sent(app)
+        assert not any(m.get('type') == 'device_state' for m in msgs)
+        warnings = [m for m in msgs if m.get('type') == 'pipeline_warning']
+        assert len(warnings) == 1
+        assert warnings[0]['reason'] == 'engine_degraded'
+        assert warnings[0]['detail']['failures'] == 3
+
+
+class TestChangeLlmControl:
+    """change_llm 控制分发：成功广播设备状态、失败回执"""
+
+    def make_app(self):
+        app = SubtitleTranslator(config_path='nonexistent-config.yaml')
+        app.websocket_server.send = AsyncMock()
+        return app
+
+    @staticmethod
+    def sent(app):
+        return [c.args[0] for c in app.websocket_server.send.call_args_list]
+
+    async def test_change_llm_success_broadcasts_device_state(self):
+        app = self.make_app()
+        app.translator = AsyncMock()
+        app.translator.resolved_device = 'cpu'
+        app.translator.device_reason = 'no_cuda'
+
+        await app._on_control_message({
+            'type': 'control', 'action': 'change_llm',
+            'model_id': 'qwen3-1.7b-q4km',
+        })
+
+        app.translator.change_llm.assert_awaited_once_with('qwen3-1.7b-q4km')
+        msgs = self.sent(app)
+        assert not [m for m in msgs if m.get('type') == 'error']
+        states = [m for m in msgs if m.get('type') == 'device_state']
+        assert states
+        assert states[0]['translation'] == {'resolved': 'cpu', 'reason': 'no_cuda'}
+
+    async def test_change_llm_invalid_receipt(self):
+        app = self.make_app()
+        app.translator.change_llm = AsyncMock(side_effect=ValueError('不支持'))
+
+        await app._on_control_message({
+            'type': 'control', 'action': 'change_llm', 'model_id': 'nope',
+        })
+
+        msgs = self.sent(app)
+        errors = [m for m in msgs if m.get('type') == 'error']
+        assert errors and errors[0]['code'] == 'invalid_llm'
+        assert not [m for m in msgs if m.get('type') == 'device_state']
+
+    async def test_change_llm_download_failure_receipt(self):
+        app = self.make_app()
+        app.translator.change_llm = AsyncMock(
+            side_effect=DownloadError('all sources failed')
+        )
+
+        await app._on_control_message({
+            'type': 'control', 'action': 'change_llm', 'model_id': 'hy-mt2-7b-q4km',
+        })
+
+        errors = [m for m in self.sent(app) if m.get('type') == 'error']
+        assert errors and errors[0]['code'] == 'model_download_failed'
+
+    async def test_change_llm_load_failure_receipt(self):
+        app = self.make_app()
+        app.translator.change_llm = AsyncMock(side_effect=RuntimeError('spawn failed'))
+
+        await app._on_control_message({
+            'type': 'control', 'action': 'change_llm', 'model_id': 'hy-mt2-7b-q4km',
+        })
+
+        errors = [m for m in self.sent(app) if m.get('type') == 'error']
+        assert errors and errors[0]['code'] == 'llm_load_failed'
+
+
+class TestBroadcastSnapshot:
+    """广播遍历快照：发送期间客户端集合被修改不得抛异常（fix-asr-runtime-stall）"""
+
+    async def test_send_tolerates_client_set_mutation(self):
+        server = WebSocketServer(
+            {'websocket': {'host': 'localhost', 'port': TEST_PORT}}
+        )
+
+        class _MutatingClient:
+            async def send(self, message):
+                server._clients.discard(self)  # 发送中断开自身
+
+        client = _MutatingClient()
+        server._clients.add(client)
+
+        await server.send({'type': 'x'})  # MUST NOT raise（旧实现抛 Set changed size）
+        assert client not in server._clients
+
+    async def test_send_reaches_remaining_clients(self):
+        server = WebSocketServer(
+            {'websocket': {'host': 'localhost', 'port': TEST_PORT}}
+        )
+
+        class _MutatingClient:
+            async def send(self, message):
+                server._clients.discard(self)
+
+        class _RecordingClient:
+            def __init__(self):
+                self.received = []
+
+            async def send(self, message):
+                self.received.append(message)
+
+        mutating = _MutatingClient()
+        recording = _RecordingClient()
+        server._clients.update({mutating, recording})
+
+        await server.send({'type': 'y'})
+
+        assert len(recording.received) == 1
+        assert json.loads(recording.received[0]) == {'type': 'y'}
 
 
 class TestDevicePreference:

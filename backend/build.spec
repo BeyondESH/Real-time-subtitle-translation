@@ -14,26 +14,37 @@ hiddenimports = [
     'soundcard',
     'numpy',
     'faster_whisper',
-    'transformers',
-    'torch',
+    'httpx',
     'websockets',
     'yaml',
     'soxr',
+    # 按进程音频捕获依赖（pycaw.__init__ 为空，需显式收集 pycaw.pycaw 以带入
+    # pycaw.api.* 子模块；comtypes.client 触发 hooks-contrib 的 comtypes 收集）
+    'comtypes',
+    'comtypes.client',
+    'pycaw',
+    'pycaw.pycaw',
+    'psutil',
     # 本地模块显式收集：免受 cwd/分析路径差异影响（曾出现 Analysis 漏收
     # audio_buffer 导致打包产物 ModuleNotFoundError 的事故）
+    'process_loopback',
     'audio_buffer',
     'audio_capture',
     'asr_engine',
     'device_support',
     'pipeline_worker',
     'translator',
+    'llama_server_manager',
+    'model_downloader',
+    'translation_models',
+    'translation_profiles',
     'language_codes',
     'vad_events',
     'websocket_server',
 ]
 
 # 原生库与数据资产完整收集（含 faster-whisper 的 silero_vad.onnx）
-for _pkg in ('ctranslate2', 'tokenizers', 'sentencepiece', 'faster_whisper', 'onnxruntime'):
+for _pkg in ('ctranslate2', 'tokenizers', 'faster_whisper', 'onnxruntime'):
     _d, _b, _h = collect_all(_pkg)
     datas += _d
     binaries += _b
@@ -48,7 +59,13 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # 翻译引擎已迁移至 llama.cpp（llama-server sidecar）：不再分发 torch/transformers。
+        # collect_all('ctranslate2') 的 converters 子模块会【可选导入】torch/transformers
+        # （第 27/28 行 try: import），必须显式排除，否则整包被拖入（实测 +2.8GB）。
+        # sentencepiece 为 transformers 的传递可选依赖，一并排除（faster-whisper 链路不需要）。
+        'torch', 'transformers', 'sentencepiece', 'torchvision', 'torchaudio',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

@@ -46,7 +46,7 @@ if not exist "config.yaml" (
 )
 
 echo.
-echo [1/4] 安装 Python 依赖...
+echo [1/5] 安装 Python 依赖...
 cd backend
 pip install -r requirements.txt
 if errorlevel 1 goto :error
@@ -55,21 +55,32 @@ if errorlevel 1 goto :error
 cd ..
 
 echo.
-echo [2/4] 构建 Python 后端...
+echo [2/5] 准备 llama.cpp 二进制（vendor，随包分发；已存在则跳过）...
+if not exist "backend\vendor\llama\win-x64-cpu\llama-server.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File backend\scripts\vendor_llama.ps1
+    if errorlevel 1 goto :error
+)
+if not exist "backend\vendor\llama\win-x64-cuda\llama-server.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File backend\scripts\vendor_llama.ps1 -CudaOnly
+    if errorlevel 1 goto :error
+)
+
+echo.
+echo [3/5] 构建 Python 后端...
 cd backend
 pyinstaller build.spec --clean --noconfirm
 if errorlevel 1 goto :error
 cd ..
 
 echo.
-echo [3/4] 安装 Electron 依赖...
+echo [4/5] 安装 Electron 依赖...
 cd frontend
 call npm install
 if errorlevel 1 goto :error
 cd ..
 
 echo.
-echo [4/4] 构建 Electron 前端...
+echo [5/5] 构建 Electron 前端...
 cd frontend
 call npm run dist
 if errorlevel 1 goto :error

@@ -1,6 +1,8 @@
 export interface SelectOption {
   value: string;
   label: string;
+  /** 分组标题/说明行不可选 */
+  disabled?: boolean;
 }
 
 export interface SelectProps {
@@ -28,7 +30,7 @@ export function Select({
         </option>
       )}
       {options.map((o) => (
-        <option key={o.value} value={o.value}>
+        <option key={o.value} value={o.value} disabled={o.disabled}>
           {o.label}
         </option>
       ))}
