@@ -73,6 +73,12 @@ echo [4/4] 构建 Electron 前端...
 cd frontend
 call npm run dist
 if errorlevel 1 goto :error
+
+echo.
+echo [校验] 构建产物样式断言（Tailwind 编译完整性）...
+cd frontend
+call npm run check:css
+if errorlevel 1 goto :error
 cd ..
 
 echo.

@@ -41,6 +41,19 @@ function check(name, ok, extra) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const ARTIFACTS = path.resolve(__dirname, '..', 'e2e-artifacts');
+
+/** 截图留档（4.1 双形态核对 / README 素材），失败不阻塞 */
+async function capture(page, name) {
+  try {
+    fs.mkdirSync(ARTIFACTS, { recursive: true });
+    await page.screenshot({ path: path.join(ARTIFACTS, name) });
+    results.push(`INFO | 截图留档 e2e-artifacts/${name}`);
+  } catch (e) {
+    results.push(`INFO | 截图失败 ${name}: ${e.message}`);
+  }
+}
+
 /**
  * Win32 WindowFromPoint + GetAncestor(GA_ROOT)（只读查询）。
  * 返回命中点的最深子窗口及其顶层根窗口：
@@ -191,13 +204,36 @@ async function main() {
     await main_.evaluate(() => window.appAPI.dispatch({ type: 'togglePause' }));
     await waitFor(() => saw((m) => m.type === 'control' && m.action === 'resume'), 5000, 'resume frame');
 
-    // ---------- 9. 主题热切换 ----------
+    // ---------- 9. 主题热切换 + 运行时视觉断言（fix-tailwind-build-pipeline） ----------
     await main_.evaluate(() => window.appAPI.setConfig('theme', 'light'));
     await main_.waitForFunction(
       () => document.documentElement.dataset.theme === 'light', null, { timeout: 5000 }
     );
     check('主题切换实时生效（config→广播→DOM）', true);
+
+    // 视觉断言：bg-base 根容器计算背景色 = 设计 token（CSS 管线真实生效的证据；
+    // 样式断链时该类无规则 → 背景为 rgba(0, 0, 0, 0)，此处必然失败）
+    await sleep(200);
+    const bgLight = await main_.evaluate(() => {
+      const el = document.querySelector('.bg-base');
+      return el ? getComputedStyle(el).backgroundColor : null;
+    });
+    check('视觉断言：亮色根容器背景 = rgb(255, 255, 255)', bgLight === 'rgb(255, 255, 255)',
+      `bg=${bgLight}`);
+    await capture(main_, 'main-light.png');
+
     await main_.evaluate(() => window.appAPI.setConfig('theme', 'dark'));
+    await main_.waitForFunction(
+      () => document.documentElement.dataset.theme !== 'light', null, { timeout: 5000 }
+    );
+    await sleep(200);
+    const bgDark = await main_.evaluate(() => {
+      const el = document.querySelector('.bg-base');
+      return el ? getComputedStyle(el).backgroundColor : null;
+    });
+    check('视觉断言：暗色根容器背景 = rgb(13, 13, 13)', bgDark === 'rgb(13, 13, 13)',
+      `bg=${bgDark}`);
+    await capture(main_, 'main-dark.png');
 
     // ---------- 9b. 会话回放页 ----------
     const sid = (await main_.evaluate(() => window.appAPI.listSessions()))[0].id;
@@ -258,6 +294,7 @@ async function main() {
     // ---------- 11. 悬浮窗扇出 + 渲染 ----------
     const overlayText = await overlay.evaluate(() => document.body.innerText);
     check('悬浮窗同步收到字幕（IPC 扇出双窗口）', overlayText.includes('隐藏窗期间第二条'));
+    await capture(overlay, 'overlay-subtitle.png');
 
     // ---------- 12. vad_state / pipeline_warning 状态路由 ----------
     send({ type: 'vad_state', state: 'speech' });
