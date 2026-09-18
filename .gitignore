@@ -66,6 +66,7 @@ tmp/
 temp/
 .codemap/
 .omo/
+openspec/
 .codemaker/codemap/
 .codemaker/codeindex/
 .codemaker/rules/codemap.mdc
