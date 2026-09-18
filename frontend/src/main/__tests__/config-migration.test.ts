@@ -5,7 +5,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planLegacyYamlMigration, runLegacyYamlMigration, type MigrationEntry } from '../config-migration';
+import { planLegacyYamlMigration, runLegacyYamlMigration, CONFIG_DEFAULTS, type MigrationEntry } from '../config-migration';
+import { WRITABLE_CONFIG_PATHS } from '../../shared/ipc-types';
 
 const LEGACY_YAML = `
 audio:
@@ -39,6 +40,16 @@ audio:
 pipeline:
   tick_ms: 250
 `;
+
+describe('推理设备配置（add-inference-device-toggle D1/D6）', () => {
+  it('默认 inference.device = auto（旧 store 零迁移兼容）', () => {
+    expect(CONFIG_DEFAULTS.inference).toEqual({ device: 'auto' });
+  });
+
+  it("WRITABLE_CONFIG_PATHS 含 'inference.device'", () => {
+    expect(WRITABLE_CONFIG_PATHS).toContain('inference.device');
+  });
+});
 
 describe('planLegacyYamlMigration', () => {
   it('legacy 段全部映射为 store 点路径 entries', () => {

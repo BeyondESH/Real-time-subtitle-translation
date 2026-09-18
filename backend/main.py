@@ -25,6 +25,7 @@ import yaml
 from audio_buffer import RingBuffer, UtteranceSegmenter
 from audio_capture import AudioCapture
 from asr_engine import ASREngine
+from device_support import VALID_DEVICES
 from pipeline_worker import PipelineWorker
 from translator import Translator
 from vad_events import VadStateBroadcaster
@@ -71,6 +72,11 @@ class SubtitleTranslator:
 
     def __init__(self, config_path: str = "config.yaml"):
         self.config = self._load_config(config_path)
+
+        # 统一设备偏好（SUBTITLE_DEVICE > config.yaml > auto），同一偏好作用于两引擎
+        self.device_preference = self._resolve_device_preference()
+        for section in ('asr', 'translation'):
+            self.config.setdefault(section, {})['device'] = self.device_preference
 
         # 管线配置
         pipeline_cfg = self.config.get('pipeline', {})
@@ -129,6 +135,25 @@ class SubtitleTranslator:
                 return yaml.safe_load(f)
         return self._default_config()
 
+    def _resolve_device_preference(self) -> str:
+        """
+        解析统一设备偏好，优先级：SUBTITLE_DEVICE（非空且≠auto）> config.yaml
+        的 asr/translation.device > auto。非法 env 值忽略并回落 config。
+        """
+        env_value = os.environ.get('SUBTITLE_DEVICE', '').strip()
+        if env_value and env_value != 'auto':
+            if env_value in VALID_DEVICES:
+                logger.info(f"设备偏好来自 SUBTITLE_DEVICE: {env_value}")
+                return env_value
+            logger.warning(f"SUBTITLE_DEVICE 非法的设备值 {env_value!r}，忽略")
+
+        for section in ('asr', 'translation'):
+            value = self.config.get(section, {}).get('device')
+            if value in ('cpu', 'cuda'):
+                logger.info(f"设备偏好来自 config.yaml {section}.device: {value}")
+                return value
+        return 'auto'
+
     def _default_config(self) -> dict:
         """默认配置"""
         return {
@@ -157,6 +182,7 @@ class SubtitleTranslator:
                 'primary_model': 'Helsinki-NLP/opus-mt-ja-zh',
                 'fallback_model': 'facebook/nllb-200-distilled-600M',
                 'target_languages': ['zh', 'en'],
+                'device': 'auto',
                 'lazy_load': True,
                 'preload_primary': True
             },
@@ -208,6 +234,9 @@ class SubtitleTranslator:
         await self.asr_engine.initialize()
         await self.translator.initialize()
 
+        # ASR 初始化完成（含降级）即广播设备状态
+        await self._broadcast_device_state()
+
         # 后台预载日中主翻译模型（失败降级为纯懒加载）
         translation_cfg = self.config.get('translation', {})
         if translation_cfg.get('preload_primary', True):
@@ -225,12 +254,13 @@ class SubtitleTranslator:
         logger.info("服务启动完成")
 
     async def _preload_primary_model(self):
-        """后台预载主翻译模型，失败时降级为懒加载"""
+        """后台预载主翻译模型，失败时降级为懒加载；完成后广播设备状态"""
         try:
             await self.translator.ensure_primary()
             logger.info("主翻译模型后台预载完成")
         except Exception as e:
             logger.warning(f"主翻译模型预载失败，将在首次使用时重试: {e}")
+        await self._broadcast_device_state()
 
     def _on_audio_chunk(self, audio_data):
         """音频块回调（录音线程，同步，只写环形缓冲）"""
@@ -286,12 +316,26 @@ class SubtitleTranslator:
         return await asyncio.to_thread(self.audio_capture.get_audio_sources)
 
     async def _method_get_config(self, _params):
-        """WS 方法：返回后端运行配置摘要"""
+        """WS 方法：返回后端运行配置摘要（含两引擎实际设备与原因）"""
         return {
             'asr': self.asr_engine.get_model_info(),
             'translation': self.translator.get_model_info(),
             'active_language': self.active_target_language,
         }
+
+    async def _broadcast_device_state(self):
+        """广播两引擎实际设备与选择/降级原因（无客户端时 send 自动跳过）"""
+        await self.websocket_server.send({
+            'type': 'device_state',
+            'asr': {
+                'resolved': self.asr_engine.resolved_device,
+                'reason': self.asr_engine.device_reason,
+            },
+            'translation': {
+                'resolved': self.translator.resolved_device,
+                'reason': self.translator.device_reason,
+            },
+        })
 
     async def _on_control_message(self, message: dict):
         """处理来自前端的控制/同步消息"""
@@ -355,6 +399,23 @@ class SubtitleTranslator:
                     'code': 'invalid_model',
                     'message': str(e)
                 })
+        elif action == 'change_device':
+            device = message.get('device')
+            if device not in VALID_DEVICES:
+                await self.websocket_server.send({
+                    'type': 'error',
+                    'code': 'invalid_device',
+                    'message': f'不支持的设备: {device}，支持: {VALID_DEVICES}'
+                })
+                return
+            try:
+                await self.asr_engine.change_device(device)
+                await self.translator.change_device(device)
+            except Exception as e:  # noqa: BLE001 - 不得冒泡到连接级 catch 导致断连
+                logger.error(f"切换设备失败: {e}", exc_info=True)
+                return
+            # 切换完成（无论是否降级）广播实际设备状态；降级不产生 error 回执
+            await self._broadcast_device_state()
         else:
             logger.warning(f"未知控制指令: {action}")
 

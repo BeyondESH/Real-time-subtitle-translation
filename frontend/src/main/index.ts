@@ -350,7 +350,7 @@ function registerShortcuts(): void {
 
 const KNOWN_INTENTS = new Set<string>([
   'togglePause', 'cycleLanguage', 'cycleModel', 'setLanguage', 'setModel',
-  'toggleLock', 'toggleOverlay', 'setAudioSource', 'newSession',
+  'toggleLock', 'toggleOverlay', 'setAudioSource', 'setDevice', 'newSession',
   'showSettings', 'restartBackend'
 ]);
 
@@ -459,6 +459,7 @@ function registerIpc(): void {
     if (
       cfgPath.startsWith('translation')
       || cfgPath === 'asr.model'
+      || cfgPath === 'inference.device'
       || cfgPath === 'audio.sourceId'
     ) {
       controller!.onConfigSaved();
@@ -666,6 +667,10 @@ app.whenReady().then(() => {
           content: '后端服务已退出，可在托盘菜单重启'
         });
       }
+    },
+    {
+      // 显式推理设备偏好经 SUBTITLE_DEVICE 注入；auto 不注入
+      getDevice: () => config!.get('inference').device
     }
   );
   gateway = new Gateway({
@@ -700,6 +705,9 @@ app.whenReady().then(() => {
     registerShortcuts();
     broadcastConfig();
   });
+
+  // 推理设备偏好变化 → 广播配置（设置页 Select 值取自 cfg.inference.device）
+  config.onDidChange('inference', () => broadcastConfig());
 
   // 7. 自动更新（打包构建才启用；启动 15s 后静默检查）
   updater = new UpdaterService({

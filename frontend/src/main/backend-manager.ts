@@ -98,6 +98,11 @@ export interface BackendManagerHooks {
 export interface BackendManagerInject {
   spawnFn?: SpawnFn;
   probeFn?: ProbeFn;
+  /**
+   * store 推理设备偏好读取（add-inference-device-toggle D3）：
+   * 仅显式值（cpu/cuda）注入 SUBTITLE_DEVICE；auto/缺省不注入。
+   */
+  getDevice?: () => 'auto' | 'cpu' | 'cuda';
 }
 
 export class BackendManager {
@@ -105,6 +110,7 @@ export class BackendManager {
   private restarting = false;
   private readonly spawnFn: SpawnFn;
   private readonly probeFn: ProbeFn;
+  private readonly getDevice: () => 'auto' | 'cpu' | 'cuda';
 
   constructor(
     private readonly paths: BackendPaths,
@@ -115,6 +121,7 @@ export class BackendManager {
   ) {
     this.spawnFn = inject.spawnFn ?? (spawn as unknown as SpawnFn);
     this.probeFn = inject.probeFn ?? probeTcp;
+    this.getDevice = inject.getDevice ?? (() => 'auto');
   }
 
   get running(): boolean {
@@ -137,6 +144,12 @@ export class BackendManager {
       SUBTITLE_LOG_DIR: logDir,
       SUBTITLE_CONFIG_PATH: ensureConfigCopy(this.paths.userDataDir, template, this.logger)
     };
+
+    // 显式设备偏好首载即生效（auto 不注入，尊重 config.yaml 手工配置）
+    const device = this.getDevice();
+    if (device !== 'auto') {
+      env.SUBTITLE_DEVICE = device;
+    }
 
     this.logger.info('启动后端:', spec.cmd, spec.args.join(' '), spec.cwd ?? '');
     try {

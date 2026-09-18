@@ -3,6 +3,16 @@
  * 与主进程 AppState/AppConfig 结构对齐；contextBridge 序列化边界，渲染层不 import 主进程模块。
  */
 
+interface DeviceEngineStateView {
+  resolved: 'cuda' | 'cpu' | null;
+  reason: 'auto' | 'user' | 'no_cuda' | 'load_failed';
+}
+
+interface DeviceStateView {
+  asr: DeviceEngineStateView;
+  translation: DeviceEngineStateView;
+}
+
 interface AppStateView {
   connection: 'connecting' | 'open' | 'reconnecting' | 'down';
   capture: 'running' | 'paused';
@@ -16,6 +26,8 @@ interface AppStateView {
   overlayVisible: boolean;
   lastWarning: { droppedTotal: number; at: number } | null;
   droppedCount: number;
+  /** 后端上报的实际推理设备（null = 尚未上报/检测中） */
+  device: DeviceStateView | null;
   activeSessionId: string | null;
 }
 
@@ -56,6 +68,8 @@ interface AppConfigView {
   };
   translation: { targetLanguages: string[]; activeLanguage: string };
   asr: { model: string };
+  /** 推理设备偏好（auto/cpu/cuda） */
+  inference: { device: 'auto' | 'cpu' | 'cuda' };
   audio: { sourceId: string };
   locked: boolean;
   theme: 'dark' | 'light' | 'system';

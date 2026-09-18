@@ -6,7 +6,7 @@
  *
  * 纯 Node 模块：不 import electron，可独立单测。
  */
-import type { ConnectionState } from './types';
+import type { ConnectionState, DeviceEngineState, DeviceStateView } from './types';
 
 export interface ModelDownload {
   name: string;
@@ -34,6 +34,8 @@ export interface AppState {
   overlayVisible: boolean;
   lastWarning: WarningInfo | null;
   droppedCount: number;
+  /** 后端上报的实际推理设备（null = 尚未上报/检测中） */
+  device: DeviceStateView | null;
   /** 当前活跃历史会话（P2 起由 HistoryStore 驱动） */
   activeSessionId: string | null;
 }
@@ -51,6 +53,7 @@ export type AppAction =
   | { type: 'lockToggled'; locked?: boolean }
   | { type: 'overlayVisibilityChanged'; visible: boolean }
   | { type: 'pipelineWarning'; droppedTotal?: number; at?: number }
+  | { type: 'deviceChanged'; device: DeviceStateView | null }
   | { type: 'activeSessionChanged'; id: string | null }
   | { type: 'configApplied'; patch: Partial<AppState> };
 
@@ -76,12 +79,23 @@ export function createInitialState(prefs: {
     overlayVisible: prefs.overlayVisible,
     lastWarning: null,
     droppedCount: 0,
+    device: null,
     activeSessionId: prefs.activeSessionId ?? null
   };
 }
 
 function sameArray(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+function sameEngine(a: DeviceEngineState, b: DeviceEngineState): boolean {
+  return a.resolved === b.resolved && a.reason === b.reason;
+}
+
+function sameDevice(a: DeviceStateView | null, b: DeviceStateView | null): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  return sameEngine(a.asr, b.asr) && sameEngine(a.translation, b.translation);
 }
 
 /**
@@ -170,6 +184,11 @@ export function reduce(state: AppState, action: AppAction): AppState {
       return state.activeSessionId === action.id
         ? state
         : { ...state, activeSessionId: action.id };
+
+    case 'deviceChanged':
+      return sameDevice(state.device, action.device)
+        ? state
+        : { ...state, device: action.device };
 
     case 'configApplied':
       return { ...state, ...action.patch };

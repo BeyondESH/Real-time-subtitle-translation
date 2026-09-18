@@ -3,6 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createInitialState, reduce, StateStore, type AppState, type AppAction } from '../state';
+import type { DeviceStateView } from '../types';
 
 function base(overrides: Partial<AppState> = {}): AppState {
   return createInitialState({
@@ -83,6 +84,29 @@ describe('reduce（纯函数）', () => {
     const s = reduce(base(), { type: 'configApplied', patch: { model: 'tiny', locked: false } });
     expect(s.model).toBe('tiny');
     expect(s.locked).toBe(false);
+  });
+
+  it('deviceChanged：设置/清空实际设备；内容相同返回同一引用', () => {
+    const view: DeviceStateView = {
+      asr: { resolved: 'cuda', reason: 'auto' },
+      translation: { resolved: 'cpu', reason: 'no_cuda' }
+    };
+    const s = reduce(base(), { type: 'deviceChanged', device: view });
+    expect(s.device).toEqual(view);
+
+    // 深相等的新对象 → 同一引用（StateStore 依赖该不变式跳过广播）
+    const same = reduce(s, {
+      type: 'deviceChanged',
+      device: {
+        asr: { resolved: 'cuda', reason: 'auto' },
+        translation: { resolved: 'cpu', reason: 'no_cuda' }
+      }
+    });
+    expect(same).toBe(s);
+
+    const s2 = reduce(s, { type: 'deviceChanged', device: null });
+    expect(s2.device).toBeNull();
+    expect(reduce(s2, { type: 'deviceChanged', device: null })).toBe(s2);
   });
 
   it('三源一致：同一 base + 同一 action 多次 reduce 结果深相等（纯函数）', () => {

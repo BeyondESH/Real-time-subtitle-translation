@@ -10,6 +10,12 @@ import logging
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
+from device_support import (
+    VALID_DEVICES,
+    decide_device,
+    normalize_device,
+    probe_compute,
+)
 from language_codes import (
     NLLB_LANGUAGE_MAP,
     normalize_lang,
@@ -35,7 +41,8 @@ class Translator:
             'fallback_model', 'facebook/nllb-200-distilled-600M'
         )
         self.target_languages = self.config.get('target_languages', ['zh', 'en'])
-        self.device = self.config.get('device', 'auto')
+        # self.device 语义保持为【配置偏好】（get_model_info 的 device 字段兼容依赖）
+        self.device = normalize_device(self.config.get('device', 'auto'))
         self.lazy_load = self.config.get('lazy_load', True)
         self.preload_primary = self.config.get('preload_primary', True)
 
@@ -49,6 +56,8 @@ class Translator:
         self._fallback_tokenizer = None
         self._initialized = False
         self._resolved_device: Optional[str] = None
+        self._device_reason: Optional[str] = None
+        self._probe: Optional[dict] = None
         self._locks: Dict[str, asyncio.Lock] = {}  # 延迟创建（需在事件循环线程）
         self._download_progress_callback: Optional[DownloadProgressCallback] = None
 
@@ -75,22 +84,37 @@ class Translator:
             self._locks[name] = lock
         return lock
 
+    @property
+    def resolved_device(self) -> Optional[str]:
+        """实际使用设备（'cuda' | 'cpu' | None=尚未解析）"""
+        return self._resolved_device
+
+    @property
+    def device_reason(self) -> Optional[str]:
+        """设备选择原因（auto | user | no_cuda | load_failed | None）"""
+        return self._device_reason
+
     def _resolve_device(self) -> str:
-        """检测并缓存可用设备"""
+        """以 torch 探针解析并缓存翻译设备，同时记录选择/降级原因"""
         if self._resolved_device is not None:
             return self._resolved_device
 
-        if self.device == 'auto':
-            try:
-                import torch
-                self._resolved_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            except ImportError:
-                logger.warning("PyTorch 未安装，翻译使用 CPU")
-                self._resolved_device = 'cpu'
-        else:
-            self._resolved_device = self.device
+        probe = probe_compute()['translation']
+        self._probe = probe
+        decision = decide_device(self.device, probe)
+        self._resolved_device = decision['resolved']
+        self._device_reason = decision['reason']
 
-        logger.info(f"翻译设备: {self._resolved_device}")
+        if self._resolved_device == 'cpu' and self.device != 'cpu':
+            logger.warning(
+                "翻译使用 CPU（reason=%s）；偏好=%s，探针: %s",
+                decision['reason'], self.device, probe.get('detail'),
+            )
+        else:
+            logger.info(
+                "翻译设备: %s（reason=%s）",
+                self._resolved_device, self._device_reason,
+            )
         return self._resolved_device
 
     async def initialize(self):
@@ -363,8 +387,54 @@ class Translator:
             self._primary_model = None
             self._primary_tokenizer = None
 
+    async def change_device(self, device: str):
+        """
+        切换翻译设备偏好：重置解析缓存、卸载已加载模型；主模型若原已加载
+        则在后台按新设备重新预载（NLLB 保持懒加载）。
+
+        Args:
+            device: 'auto' | 'cpu' | 'cuda'
+
+        Raises:
+            ValueError: 设备值不受支持
+        """
+        if device not in VALID_DEVICES:
+            raise ValueError(f"不支持的设备: {device}，支持: {VALID_DEVICES}")
+
+        if device == self.device:
+            logger.info(f"翻译设备偏好已是 {device}，无需切换")
+            return
+
+        logger.info(f"切换翻译设备: {self.device} -> {device}")
+        previous_primary_loaded = self._primary_model is not None
+
+        self.device = device
+        self._resolved_device = None
+        self._device_reason = None
+
+        async with self._get_lock('primary'):
+            self._primary_model = None
+            self._primary_tokenizer = None
+        async with self._get_lock('nllb'):
+            self._fallback_model = None
+            self._fallback_tokenizer = None
+
+        # 立即按新偏好解析设备（结果同步可见）
+        self._resolve_device()
+
+        if previous_primary_loaded and self.preload_primary:
+            asyncio.create_task(self._preload_primary_after_switch())
+
+    async def _preload_primary_after_switch(self):
+        """设备切换后按新设备后台重新预载主模型，失败降级为懒加载"""
+        try:
+            await self.ensure_primary()
+            logger.info("翻译设备切换后主模型预载完成")
+        except Exception as e:
+            logger.warning(f"翻译设备切换后主模型预载失败，将在首次使用时重试: {e}")
+
     def get_model_info(self) -> dict:
-        """获取模型信息"""
+        """获取模型信息（device=配置偏好；resolved_device/device_reason=实际结果）"""
         return {
             'primary_model': self.primary_model_name,
             'fallback_model': self.fallback_model_name,
@@ -374,5 +444,7 @@ class Translator:
             'nllb_loaded': self.nllb_loaded,
             'lazy_load': self.lazy_load,
             'device': self.device,
+            'resolved_device': self._resolved_device,
+            'device_reason': self._device_reason,
             'nllb_languages': sorted(NLLB_LANGUAGE_MAP.keys()),
         }

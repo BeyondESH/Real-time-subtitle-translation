@@ -36,6 +36,32 @@ const DISPLAY_MODES = [
   { value: 'translation_only', label: '仅译文' }
 ];
 
+const DEVICE_OPTIONS = [
+  { value: 'auto', label: '自动（检测到 GPU 时使用）' },
+  { value: 'cpu', label: 'CPU' },
+  { value: 'cuda', label: 'GPU' }
+];
+
+/**
+ * 实际设备 + 原因 → 状态文案（settings-management spec「推理设备设置与状态显示」）。
+ * resolved=null/缺失 → 检测中；MUST NOT 以配置偏好冒充实际设备。
+ */
+export function deviceStatusText(device: AppStateView['device'] | undefined): string {
+  const asr = device?.asr;
+  if (!asr || asr.resolved === null) return '正在检测推理设备…';
+  if (asr.resolved === 'cuda') {
+    return asr.reason === 'user' ? 'GPU（用户指定）' : 'GPU（CUDA 自动检测）';
+  }
+  switch (asr.reason) {
+    case 'no_cuda':
+      return 'CPU（未检测到兼容的 CUDA 环境）';
+    case 'load_failed':
+      return 'CPU（GPU 加载失败，已自动降级）';
+    default:
+      return 'CPU（用户指定）';
+  }
+}
+
 const THEME_ITEMS = [
   { value: 'dark', label: '暗色' },
   { value: 'light', label: '亮色' },
@@ -71,7 +97,7 @@ export function SettingsPage() {
         {current === 'general' && <GeneralSection cfg={cfg} />}
         {current === 'subtitle' && <SubtitleSection cfg={cfg} supportsAcrylic={env?.supportsAcrylic ?? false} />}
         {current === 'audio' && <AudioSection state={state} />}
-        {current === 'model' && <ModelSection state={state} />}
+        {current === 'model' && <ModelSection state={state} cfg={cfg} />}
         {current === 'shortcuts' && <ShortcutsSection cfg={cfg} />}
         {current === 'advanced' && <AdvancedSection version={env?.version ?? ''} />}
         <ToastHost />
@@ -424,7 +450,8 @@ function AudioSection({ state }: { state: AppStateView | null }) {
 
 // ---------- 模型 ----------
 
-function ModelSection({ state }: { state: AppStateView | null }) {
+export function ModelSection({ state, cfg }: { state: AppStateView | null; cfg: AppConfigView }) {
+  const device = cfg.inference?.device ?? 'auto';
   return (
     <div className="max-w-xl">
       <SectionTitle>模型</SectionTitle>
@@ -439,6 +466,21 @@ function ModelSection({ state }: { state: AppStateView | null }) {
       </Row>
       <p className="mb-5 text-xs text-secondary opacity-60">
         切换立即生效；首次使用某档位会自动下载（约 40MB~1.5GB），进度见下方与直播流页。
+      </p>
+      <Row label="推理设备">
+        <span className="w-56">
+          <Select
+            options={DEVICE_OPTIONS}
+            value={device}
+            onChange={(v) => void window.appAPI.dispatch({ type: 'setDevice', device: v })}
+          />
+        </span>
+      </Row>
+      <p className="mb-5 -mt-3 text-xs text-secondary">
+        当前使用：{deviceStatusText(state?.device)}
+      </p>
+      <p className="mb-5 text-xs text-secondary opacity-60">
+        切换设备将重新加载模型，期间字幕可能短暂延迟。
       </p>
       {state?.modelDownload && (
         <div className="max-w-md">

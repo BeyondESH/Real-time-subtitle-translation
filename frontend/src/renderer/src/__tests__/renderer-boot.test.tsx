@@ -23,6 +23,7 @@ const STATE: AppStateView = {
   overlayVisible: true,
   lastWarning: null,
   droppedCount: 0,
+  device: null,
   activeSessionId: 'sess-1'
 };
 
@@ -53,6 +54,7 @@ function makeConfig(over: Partial<AppConfigView['onboarding']> = {}): AppConfigV
     },
     translation: { targetLanguages: ['zh', 'en'], activeLanguage: 'zh' },
     asr: { model: 'base' },
+    inference: { device: 'auto' },
     audio: { sourceId: '' },
     locked: true,
     theme: 'dark',

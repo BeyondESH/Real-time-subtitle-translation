@@ -96,7 +96,7 @@ describe('BackendManager 生命周期', () => {
   beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bmm-')); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); vi.restoreAllMocks(); });
 
-  function makeManager() {
+  function makeManager(getDevice: () => 'auto' | 'cpu' | 'cuda' = () => 'auto') {
     fs.mkdirSync(path.join(tmpDir, 'repo'), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'repo', 'config.yaml'), 'audio: {}', 'utf8');
     const calls: Array<{ cmd: string; args: string[]; env: NodeJS.ProcessEnv; cwd?: string }> = [];
@@ -110,7 +110,8 @@ describe('BackendManager 生命周期', () => {
           calls.push({ cmd, args, env: opts.env, cwd: opts.cwd });
           return child as unknown as ChildProcess;
         },
-        probeFn: async () => true
+        probeFn: async () => true,
+        getDevice
       }
     );
     return { mgr, calls, child, exits };
@@ -124,6 +125,23 @@ describe('BackendManager 生命周期', () => {
     expect(calls[0].env.SUBTITLE_LOG_DIR).toBe(path.join(tmpDir, 'userData', 'logs'));
     expect(calls[0].env.SUBTITLE_CONFIG_PATH).toBe(path.join(tmpDir, 'userData', 'config.yaml'));
     expect(fs.existsSync(calls[0].env.SUBTITLE_CONFIG_PATH!)).toBe(true); // 副本已生成
+  });
+
+  it('推理设备 auto：不注入 SUBTITLE_DEVICE', () => {
+    const { mgr, calls } = makeManager(() => 'auto');
+    mgr.start();
+    expect(calls[0].env.SUBTITLE_DEVICE).toBeUndefined();
+  });
+
+  it('推理设备显式 cpu/cuda：注入 SUBTITLE_DEVICE', () => {
+    const first = makeManager(() => 'cuda');
+    first.mgr.start();
+    expect(first.calls[0].env.SUBTITLE_DEVICE).toBe('cuda');
+
+    fs.mkdirSync(path.join(tmpDir, 'repo'), { recursive: true });
+    const second = makeManager(() => 'cpu');
+    second.mgr.start();
+    expect(second.calls[0].env.SUBTITLE_DEVICE).toBe('cpu');
   });
 
   it('start 幂等：重复调用只 spawn 一次', () => {

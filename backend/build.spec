@@ -24,6 +24,7 @@ hiddenimports = [
     'audio_buffer',
     'audio_capture',
     'asr_engine',
+    'device_support',
     'pipeline_worker',
     'translator',
     'language_codes',

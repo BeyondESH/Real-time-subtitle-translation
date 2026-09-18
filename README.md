@@ -18,6 +18,7 @@
 - **主窗口** — ChatGPT 式布局：直播字幕流、会话侧栏（今天/昨天/更早）、状态胶囊条（音频源·模型·语言·连接状态就地切换）、应用内设置页（六分段，改动即生效）
 - **实时音频捕获** — WASAPI 回环捕获系统音频，设备可选；多显示器：悬浮窗可指定显示器、按显示器记忆位置、越界自动回收
 - **语音识别** — faster-whisper + 内置 Silero VAD 切句，语句结束约 1~2.5 秒出字幕；"聆听中"实时脉冲指示
+- **推理设备** — 自动/CPU/GPU 三态切换：启动自动检测 CUDA（识别经 CTranslate2 探针、翻译经 torch 探针），检测到即用 GPU；不可用或加载失败静默降级 CPU+int8 继续运行，设置页实时显示实际设备与降级原因
 - **多语种翻译** — 日中专用模型 + NLLB-200 全语种（懒加载）
 - **悬浮字幕窗** — 锁定（鼠标穿透）/解锁（拖拽）双模式、始终置顶；入场动效；暂停徽标；过载告警细条；纯文字 / 毛玻璃胶囊（Windows 11 亚克力）双外观预设
 - **会话历史** — SQLite 本地持久化：每场直播/会议一个会话，自动以首句命名；全文搜索（原文+译文）；回放定位；导出 **SRT / TXT 双语 / Markdown / JSON**（后端时间戳透传，SRT 时间轴精确）
@@ -53,7 +54,7 @@
 #### 系统要求
 
 - **操作系统**: Windows 10 1809+ / Windows 11（毛玻璃预设需 Win11）
-- **GPU**: NVIDIA 显卡（推荐加速；无 GPU 自动 CPU + int8）
+- **GPU**: NVIDIA 显卡（推荐加速；启动自动检测启用，不可用或加载失败静默降级 CPU + int8）
 - **内存**: 8GB+；**硬盘**: 5GB+（模型文件）
 
 #### 安装（普通用户）
@@ -101,7 +102,7 @@ npm run dev
 
 | 配置 | 位置 | 内容 |
 |------|------|------|
-| **用户偏好** | `%APPDATA%\real-time-subtitle-translator\config.json`（electron-store） | 字幕样式/外观预设、主题、窗口位置与显示器、快捷键、目标/激活语言、模型档位、音频源、开机自启、会话设置 |
+| **用户偏好** | `%APPDATA%\real-time-subtitle-translator\config.json`（electron-store） | 字幕样式/外观预设、主题、窗口位置与显示器、快捷键、目标/激活语言、模型档位、推理设备、音频源、开机自启、会话设置 |
 | **后端管线** | `%APPDATA%\real-time-subtitle-translator\config.yaml`（首装自动复制，**可手工编辑**） | audio / pipeline / vad / asr / translation / websocket |
 
 ```yaml
@@ -117,7 +118,7 @@ vad:
   speech_pad_ms: 200
 asr:
   model_size: base        # tiny/base/small/medium/large-v3
-  device: auto            # auto/cpu/cuda（无 CUDA 自动降级 cpu+int8）
+  device: auto            # auto/cpu/cuda；auto=检测到即优先 GPU，失败静默降级 cpu+int8（UI 设置优先于此文件）
 translation:
   primary_model: Helsinki-NLP/opus-mt-ja-zh
   fallback_model: facebook/nllb-200-distilled-600M
@@ -125,6 +126,9 @@ translation:
 
 > 从 1.x 升级：旧 config.yaml 中 subtitle/system/shortcuts 段的自定义值会在升级
 > 首启时**一次性迁移**进用户偏好存储，原文件保留不改写。
+
+> 推理设备日常在 设置→模型 切换（存于用户偏好）：显式选择 CPU/GPU 时经 `SUBTITLE_DEVICE`
+> 注入后端首载，优先于本文件；本文件的 `device` 仅在偏好为"自动"时作为后端默认值生效。
 
 ### 模型说明
 
@@ -194,7 +198,12 @@ build.bat --console  # 调试构建（后端带控制台窗口）
 **没有声音捕获？** 确认正在播放音频、设置→音频里回环设备选择正确、系统未静音。
 
 **翻译延迟高？** 正常语句延迟约 1~2.5 秒。持续偏高时：换更小模型（Ctrl+Shift+M）、
-确认 GPU 已启用、出现"处理过载"告警细条说明跟不上，请降模型档位。
+确认 GPU 已启用（设置→模型"推理设备"状态行）、出现"处理过载"告警细条说明跟不上，请降模型档位。
+
+**GPU 未启用？** 设置→模型 的"推理设备"状态行显示实际设备与原因："CPU（未检测到兼容的
+CUDA 环境）"=环境无可用 CUDA；"CPU（GPU 加载失败，已自动降级）"=检测到但加载失败（排查见
+`logs/backend.log`）。注意：识别引擎（Whisper）在 NVIDIA GPU 上自动启用；翻译引擎 GPU 需
+CUDA 构建的 torch，当前发布版为 CPU 构建，翻译走 CPU 属预期。
 
 **快捷键无效？** 设置→快捷键查看注册状态；显示"注册失败"表示被其他应用占用，
 可点"修改"重录组合键。
@@ -211,6 +220,7 @@ build.bat --console  # 调试构建（后端带控制台窗口）
 - **Main window** — ChatGPT-style: live caption stream, session sidebar, status pill bar (audio source / model / language / connection, switch in place), in-app settings (6 sections, changes apply instantly)
 - **Session history** — local SQLite: searchable (original + translation), replay with jump-to-hit, export **SRT / bilingual TXT / Markdown / JSON** (accurate SRT timeline via backend timestamps)
 - **Overlay** — lock (click-through) / unlock (draggable), always-on-top; entry animation; pause badge; overload strip; plain-text or **acrylic pill** preset (Windows 11)
+- **Inference device** — Auto/CPU/GPU toggle; CUDA auto-detected at startup (CTranslate2 probe for ASR, torch probe for translation), silent CPU+int8 fallback on failure; settings shows the actual device and fallback reason
 - **Multi-display** — pick a display for the overlay, per-display position memory, off-screen auto-recall
 - **Global shortcuts** — pause / cycle language / cycle model / toggle lock, **re-recordable** in settings with visible conflict warnings
 - **First-run onboarding** — welcome → audio source → model download progress → done (skippable)

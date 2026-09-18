@@ -41,6 +41,9 @@ export interface ShortcutSet {
   toggleLock: string;
 }
 
+/** 推理设备偏好（统一管 ASR 与翻译；与后端控制协议同词汇） */
+export type InferenceDevice = 'auto' | 'cpu' | 'cuda';
+
 export interface AppConfig {
   window: WindowConfig;
   subtitle: SubtitleConfig;
@@ -50,6 +53,8 @@ export interface AppConfig {
   shortcutStatus: Record<keyof ShortcutSet, boolean>;
   translation: { targetLanguages: string[]; activeLanguage: string };
   asr: { model: string };
+  /** 推理设备偏好；auto=后端自动探测（显式 cpu/cuda 经 SUBTITLE_DEVICE 注入） */
+  inference: { device: InferenceDevice };
   audio: { sourceId: string };
   locked: boolean;
   /** 主题：dark（默认）/ light / system */
@@ -92,6 +97,7 @@ export const CONFIG_DEFAULTS: AppConfig = {
   },
   translation: { targetLanguages: ['zh', 'en'], activeLanguage: 'zh' },
   asr: { model: 'base' },
+  inference: { device: 'auto' },
   audio: { sourceId: '' },
   locked: true,
   theme: 'dark',

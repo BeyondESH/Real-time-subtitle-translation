@@ -47,12 +47,37 @@ export interface VadStateMessage {
   state: 'speech' | 'silence';
 }
 
+/** 实际解析出的设备（null = 加载/检测中） */
+export type DeviceResolved = 'cuda' | 'cpu' | null;
+
+/** 设备原因：用户指定 / 自动检测成功 / 无 CUDA / GPU 加载失败降级 */
+export type DeviceReason = 'auto' | 'user' | 'no_cuda' | 'load_failed';
+
+export interface DeviceEngineState {
+  resolved: DeviceResolved;
+  reason: DeviceReason;
+}
+
+/**
+ * 后端 device_state 广播（add-inference-device-toggle D8）。
+ * 旧后端不发送（type 不存在），新后端字段完整；消费方对缺失字段容错。
+ */
+export interface DeviceStateMessage {
+  type: 'device_state';
+  asr: DeviceEngineState;
+  translation: DeviceEngineState;
+}
+
+/** device_state 去掉 type 后的视图（AppState.device / get_config 种子形状） */
+export type DeviceStateView = Omit<DeviceStateMessage, 'type'>;
+
 export type KnownBroadcast =
   | SubtitleMessage
   | ModelProgressMessage
   | PipelineWarningMessage
   | BackendErrorMessage
-  | VadStateMessage;
+  | VadStateMessage
+  | DeviceStateMessage;
 
 export type UnknownBroadcast = { type: string } & Record<string, unknown>;
 

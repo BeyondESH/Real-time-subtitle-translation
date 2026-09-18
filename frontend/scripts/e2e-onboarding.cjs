@@ -51,7 +51,14 @@ async function main() {
         const result = msg.method === 'get_audio_sources'
           ? [{ id: 'fake-dev', name: '假扬声器 (E2E)', is_loopback: true }]
           : msg.method === 'get_config'
-            ? { asr: { model_size: 'base' }, translation: {}, active_language: 'zh' }
+            ? {
+                asr: {
+                  model_size: 'base', device: 'auto',
+                  resolved_device: 'cpu', device_reason: 'no_cuda'
+                },
+                translation: { resolved_device: 'cpu', device_reason: 'no_cuda' },
+                active_language: 'zh'
+              }
             : null;
         ws.send(JSON.stringify({ type: 'response', id: msg.id, ok: true, result }));
       }

@@ -51,6 +51,7 @@ const prefs = (over: Partial<PrefsSnapshot> = {}): PrefsSnapshot => ({
   activeLanguage: 'zh',
   model: 'base',
   audioSourceId: '',
+  device: 'auto',
   ...over
 });
 
@@ -135,5 +136,56 @@ describe('alignPreferences', () => {
     socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
     await p;
     expect(socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
+  });
+});
+
+describe('alignPreferences 设备对齐（add-inference-device-toggle D9）', () => {
+  const CONFIG_WITH_DEVICE = (
+    device: string, resolved: string, reason: string
+  ) => ({
+    asr: { model_size: 'base', device, resolved_device: resolved, device_reason: reason },
+    translation: { resolved_device: resolved, device_reason: reason }
+  });
+
+  async function run(over: Partial<PrefsSnapshot>, result: unknown) {
+    const { gw, socket } = makeOpenGateway();
+    const p = alignPreferences(gw, prefs(over), new AlignmentTracker(), silentLogger);
+    const req = socket.sentJson().find((f) => f.type === 'request');
+    socket.emit({ type: 'response', id: req?.id, ok: true, result });
+    const view = await p;
+    return { socket, view };
+  }
+
+  it('store 显式 cuda 且与后端偏好不一致 → 下发 change_device', async () => {
+    const { socket } = await run({ device: 'cuda' }, CONFIG_WITH_DEVICE('auto', 'cpu', 'no_cuda'));
+    expect(socket.sentJson()).toContainEqual({ type: 'control', action: 'change_device', device: 'cuda' });
+  });
+
+  it('store 显式值与后端偏好一致 → 不发 change_device', async () => {
+    const { socket } = await run({ device: 'cpu' }, CONFIG_WITH_DEVICE('cpu', 'cpu', 'user'));
+    expect(socket.sentJson().some((f) => f.action === 'change_device')).toBe(false);
+  });
+
+  it('store 为 auto → 不对齐设备（以后端解析为准）', async () => {
+    const { socket } = await run({ device: 'auto' }, CONFIG_WITH_DEVICE('cuda', 'cuda', 'auto'));
+    expect(socket.sentJson().some((f) => f.action === 'change_device')).toBe(false);
+  });
+
+  it('旧后端缺 asr.device → 容错不发送', async () => {
+    const { socket } = await run({ device: 'cuda' }, { asr: { model_size: 'base' }, translation: {} });
+    expect(socket.sentJson().some((f) => f.action === 'change_device')).toBe(false);
+  });
+
+  it('以 get_config 的 resolved_device/device_reason 初始化设备视图', async () => {
+    const { view } = await run({ device: 'auto' }, CONFIG_WITH_DEVICE('auto', 'cpu', 'load_failed'));
+    expect(view).toEqual({
+      asr: { resolved: 'cpu', reason: 'load_failed' },
+      translation: { resolved: 'cpu', reason: 'load_failed' }
+    });
+  });
+
+  it('旧后端 resolved 字段全缺 → 返回 null（保持检测态）', async () => {
+    const { view } = await run({ device: 'auto' }, { asr: { model_size: 'base' }, translation: {} });
+    expect(view).toBeNull();
   });
 });

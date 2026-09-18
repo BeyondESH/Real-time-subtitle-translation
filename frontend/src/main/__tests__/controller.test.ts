@@ -389,3 +389,83 @@ describe('其它广播路由', () => {
     h.gateway.close();
   });
 });
+
+describe('推理设备（add-inference-device-toggle D9）', () => {
+  const DEVICE_STATE_CPU = {
+    type: 'device_state',
+    asr: { resolved: 'cpu', reason: 'no_cuda' },
+    translation: { resolved: 'cpu', reason: 'no_cuda' }
+  };
+
+  it('setDevice：下发 change_device + 落盘 + 切换中置 device=null', () => {
+    const h = makeHarness();
+    h.controller.handle({ type: 'setDevice', device: 'cuda' });
+    expect(h.socket.sentJson()).toContainEqual({
+      type: 'control', action: 'change_device', device: 'cuda'
+    });
+    expect((h.config.get('inference') as { device: string }).device).toBe('cuda');
+    expect(h.state.getState().device).toBeNull();
+    h.gateway.close();
+  });
+
+  it('setDevice 同值幂等：不发帧、不改状态', () => {
+    const h = makeHarness();
+    h.controller.handle({ type: 'setDevice', device: 'auto' });
+    expect(h.socket.sentJson().some((f) => f.action === 'change_device')).toBe(false);
+    h.gateway.close();
+  });
+
+  it('device_state 广播 → 更新 AppState.device（含降级 cpu+load_failed，无错误 toast）', () => {
+    const h = makeHarness();
+    h.controller.handle({ type: 'setDevice', device: 'cuda' });
+    const toastsBefore = h.broadcasts.filter((b) => b.channel === 'app:toast').length;
+    h.socket.emit({
+      type: 'device_state',
+      asr: { resolved: 'cpu', reason: 'load_failed' },
+      translation: { resolved: 'cpu', reason: 'no_cuda' }
+    });
+    expect(h.state.getState().device).toEqual({
+      asr: { resolved: 'cpu', reason: 'load_failed' },
+      translation: { resolved: 'cpu', reason: 'no_cuda' }
+    });
+    // 静默降级：select 保持用户选择，不视为失败
+    expect((h.config.get('inference') as { device: string }).device).toBe('cuda');
+    expect(h.broadcasts.filter((b) => b.channel === 'app:toast').length).toBe(toastsBefore);
+    h.gateway.close();
+  });
+
+  it('device_state resolved=null → 检测态（device 置 null）', () => {
+    const h = makeHarness();
+    h.socket.emit(DEVICE_STATE_CPU);
+    expect(h.state.getState().device).not.toBeNull();
+    h.socket.emit({
+      type: 'device_state',
+      asr: { resolved: null, reason: 'auto' },
+      translation: { resolved: null, reason: 'auto' }
+    });
+    expect(h.state.getState().device).toBeNull();
+    h.gateway.close();
+  });
+
+  it('invalid_device 回执 → 偏好与设备视图回退 + 错误 toast', () => {
+    const h = makeHarness();
+    h.socket.emit(DEVICE_STATE_CPU);
+    h.controller.handle({ type: 'setDevice', device: 'cuda' });
+    h.socket.emit({ type: 'error', code: 'invalid_device', message: '不支持的推理设备' });
+    expect((h.config.get('inference') as { device: string }).device).toBe('auto');
+    expect(h.state.getState().device).toEqual({
+      asr: { resolved: 'cpu', reason: 'no_cuda' },
+      translation: { resolved: 'cpu', reason: 'no_cuda' }
+    });
+    const errors = (h.broadcasts.filter((b) => b.channel === 'app:toast') as
+      Array<{ payload: { kind: string; text: string } }>).filter((t) => t.payload.kind === 'error');
+    expect(errors.some((t) => t.payload.text.includes('不支持的推理设备'))).toBe(true);
+    h.gateway.close();
+  });
+
+  it('旧后端无 device_state 广播 + get_config 无设备字段 → device 保持 null', () => {
+    const h = makeHarness(); // 对齐响应仅含 model_size
+    expect(h.state.getState().device).toBeNull();
+    h.gateway.close();
+  });
+});

@@ -9,9 +9,9 @@ import type { Gateway } from './gateway';
 import type { AppState, StateStore } from './state';
 import type { ConfigStore } from './config';
 import type { HistoryStore } from './history-db';
-import { AlignmentTracker, alignPreferences, type PrefsSnapshot } from './prefs-align';
+import { AlignmentTracker, alignPreferences, deviceViewFromBroadcast, type PrefsSnapshot } from './prefs-align';
 import type {
-  BackendErrorMessage, GatewayLogger, Intent, KnownBroadcast, ModelProgressMessage,
+  BackendErrorMessage, DeviceStateView, GatewayLogger, Intent, KnownBroadcast, ModelProgressMessage,
   PipelineWarningMessage, SubtitleMessage, ToastMessage, UnknownBroadcast, VadStateMessage
 } from '../shared/ipc-types';
 
@@ -47,6 +47,8 @@ export class Controller {
     model?: string;
     activeLanguage?: string;
     audioSource?: string;
+    device?: 'auto' | 'cpu' | 'cuda';
+    deviceState?: DeviceStateView | null;
   } = {};
 
   constructor(private readonly deps: ControllerDeps) {
@@ -61,15 +63,19 @@ export class Controller {
       targetLanguages: t.targetLanguages,
       activeLanguage: t.activeLanguage,
       model: this.deps.config.get('asr').model,
-      audioSourceId: this.deps.config.get('audio').sourceId
+      audioSourceId: this.deps.config.get('audio').sourceId,
+      device: this.deps.config.get('inference').device
     };
   }
 
-  /** 连接建立/配置保存后把后端运行态对齐到 store 偏好 */
-  align(): Promise<void> {
-    return alignPreferences(
+  /** 连接建立/配置保存后把后端运行态对齐到 store 偏好（含实际设备种入 AppState） */
+  async align(): Promise<void> {
+    const view = await alignPreferences(
       this.deps.gateway, this.prefs(), this.deps.tracker, this.deps.logger
     );
+    if (view) {
+      this.deps.state.dispatch({ type: 'deviceChanged', device: view });
+    }
   }
 
   /** 后端进程（重）启动后调用：音频源需重新应用 */
@@ -157,6 +163,16 @@ export class Controller {
         this.deps.broadcast('history:changed', { kind: 'session' });
         return;
       }
+      case 'setDevice': {
+        const prev = this.prefs().device;
+        if (prev === intent.device) return;
+        if (intent.device !== 'auto' && intent.device !== 'cpu' && intent.device !== 'cuda') {
+          this.toast(`不支持的推理设备: ${String(intent.device)}`, 'error');
+          return;
+        }
+        this.applyDevice(intent.device);
+        return;
+      }
       case 'showSettings':
         this.deps.onShowSettings();
         return;
@@ -220,6 +236,15 @@ export class Controller {
     this.deps.state.dispatch({ type: 'modelChanged', model: next });
   }
 
+  private applyDevice(next: 'auto' | 'cpu' | 'cuda'): void {
+    this.optimistic.device = this.prefs().device;
+    this.optimistic.deviceState = this.deps.state.getState().device;
+    this.deps.gateway.send({ type: 'control', action: 'change_device', device: next });
+    this.deps.config.set('inference', { device: next });
+    // 切换中：状态行回到"正在检测"，待 device_state 广播/降级结果刷新；静默降级不算失败
+    this.deps.state.dispatch({ type: 'deviceChanged', device: null });
+  }
+
   private wireGateway(): void {
     this.deps.gateway.onEvent((e) => {
       if (e.kind === 'state') {
@@ -278,6 +303,14 @@ export class Controller {
         }
         return;
       }
+      case 'device_state': {
+        // resolved=null（加载中）也更新：切换期间状态行即时反映检测态
+        this.deps.state.dispatch({
+          type: 'deviceChanged',
+          device: deviceViewFromBroadcast(msg)
+        });
+        return;
+      }
       default:
         this.deps.logger.info('未路由的广播类型:', msg.type);
     }
@@ -309,6 +342,16 @@ export class Controller {
         if (prev === undefined) return;
         this.deps.config.set('audio', { sourceId: prev });
         this.deps.state.dispatch({ type: 'audioSourceChanged', audioSource: prev });
+        break;
+      }
+      case 'invalid_device': {
+        const prev = this.optimistic.device;
+        if (prev === undefined) return;
+        const prevView = this.optimistic.deviceState ?? null;
+        this.optimistic.device = undefined;
+        this.optimistic.deviceState = undefined;
+        this.deps.config.set('inference', { device: prev });
+        this.deps.state.dispatch({ type: 'deviceChanged', device: prevView });
         break;
       }
       default:

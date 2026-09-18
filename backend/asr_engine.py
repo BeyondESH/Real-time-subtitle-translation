@@ -11,6 +11,14 @@ from typing import Callable, Optional
 import numpy as np
 from faster_whisper import WhisperModel
 
+from device_support import (
+    CPU_COMPUTE_TYPE,
+    VALID_DEVICES,
+    decide_device,
+    normalize_device,
+    probe_compute,
+)
+
 logger = logging.getLogger(__name__)
 
 # 模型下载进度回调类型
@@ -35,9 +43,15 @@ class ASREngine:
     def __init__(self, config: dict):
         self.config = config.get('asr', {})
         self.model_size = self.config.get('model_size', 'base')
-        self.device = self.config.get('device', 'auto')
+        # self.device 语义保持为【配置偏好】（get_model_info 的 device 字段兼容依赖）
+        self.device = normalize_device(self.config.get('device', 'auto'))
         self.language = self.config.get('language', None)
         self.compute_type = self.config.get('compute_type', 'float16')
+
+        # 实际使用设备与选择/降级原因（加载后填充）
+        self._resolved_device: Optional[str] = None
+        self._device_reason: Optional[str] = None
+        self._probe: Optional[dict] = None
 
         # 模型缓存目录
         self.model_cache_dir = Path.home() / '.cache' / 'subtitle-translator' / 'whisper'
@@ -54,26 +68,32 @@ class ASREngine:
         """模型已初始化且不在切换中"""
         return self._initialized and not self._switching
 
-    def _detect_device(self) -> str:
+    @property
+    def resolved_device(self) -> Optional[str]:
+        """实际使用设备（'cuda' | 'cpu' | None=尚未加载）"""
+        return self._resolved_device
+
+    @property
+    def device_reason(self) -> Optional[str]:
+        """设备选择/降级原因（auto | user | no_cuda | load_failed | None）"""
+        return self._device_reason
+
+    def _detect_device(self, load_result: Optional[bool] = None,
+                       probe: Optional[dict] = None) -> dict:
         """
-        检测可用的计算设备
+        检测并决策 ASR 设备（经 device_support 的 CTranslate2 探针）
+
+        Args:
+            load_result: None=尚未尝试；False=GPU 加载失败（触发 load_failed）
+            probe: 复用外部已取得的探针结果，避免重复探测
 
         Returns:
-            设备类型: 'cuda' 或 'cpu'
+            device_support.decide_device 的决策字典
         """
-        if self.device == 'auto':
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    logger.info("检测到 CUDA GPU，使用 GPU 加速")
-                    return 'cuda'
-                else:
-                    logger.info("未检测到 CUDA GPU，使用 CPU")
-                    return 'cpu'
-            except ImportError:
-                logger.warning("PyTorch 未安装，使用 CPU")
-                return 'cpu'
-        return self.device
+        if probe is None:
+            probe = probe_compute()['asr']
+        self._probe = probe
+        return decide_device(self.device, probe, load_result=load_result)
 
     def set_download_progress_callback(self, callback: DownloadProgressCallback):
         """
@@ -91,7 +111,12 @@ class ASREngine:
         logger.info(f"[{model_name}] {progress:.1f}% - {message}")
 
     async def initialize(self):
-        """初始化 ASR 引擎"""
+        """
+        初始化 ASR 引擎（统一加载路径，含静默降级）
+
+        偏好 × 探针决策设备：探针不可用直接 CPU+int8；尝试 GPU 加载失败
+        静默重试 CPU+int8（reason=load_failed）。CPU 重试仍失败才冒泡。
+        """
         if self._initialized:
             return
 
@@ -99,29 +124,64 @@ class ASREngine:
         self._report_progress(self.model_size, 0, "准备加载模型...")
         start_time = time.time()
 
-        device = self._detect_device()
-
-        # 根据设备选择计算类型
-        if device == 'cpu':
-            compute_type = 'int8'  # CPU 使用 INT8 加速
-        else:
-            compute_type = self.compute_type
-
-        self._report_progress(self.model_size, 10, f"正在下载模型 ({self.MODEL_SIZES.get(self.model_size, '未知')})...")
-
-        # 在线程中加载模型（避免阻塞）
-        # faster-whisper 会自动下载模型到缓存目录
-        self._model = await asyncio.to_thread(
-            self._load_model_with_progress,
-            self.model_size,
-            device,
-            compute_type
-        )
+        await self._load_with_fallback()
 
         elapsed = time.time() - start_time
         self._report_progress(self.model_size, 100, f"模型加载完成 ({elapsed:.1f}s)")
-        logger.info(f"模型加载完成，耗时: {elapsed:.2f}s，设备: {device}")
+        logger.info(
+            "模型加载完成，耗时: %.2fs，偏好: %s，实际设备: %s（reason=%s）",
+            elapsed, self.device, self._resolved_device, self._device_reason,
+        )
         self._initialized = True
+
+    async def _load_with_fallback(self):
+        """统一加载路径：探针决策 → 尝试 GPU → 失败静默降级 CPU+int8。"""
+        probe = probe_compute()['asr']
+        decision = self._detect_device(probe=probe)
+
+        self._report_progress(
+            self.model_size, 10,
+            f"正在下载模型 ({self.MODEL_SIZES.get(self.model_size, '未知')})...",
+        )
+
+        if decision['attempt_cuda']:
+            try:
+                self._model = await asyncio.to_thread(
+                    self._load_model_with_progress,
+                    self.model_size,
+                    'cuda',
+                    self.compute_type,
+                )
+                self._resolved_device = 'cuda'
+                self._device_reason = decision['reason']
+                logger.info(
+                    "ASR 使用 CUDA（reason=%s）；探针: %s",
+                    decision['reason'], probe.get('detail'),
+                )
+                return
+            except Exception as e:  # noqa: BLE001 - GPU 加载失败静默降级，不冒泡
+                logger.warning(
+                    "ASR GPU 加载失败，静默降级 CPU+int8（偏好=%s，reason=load_failed，探针=%s）：%s",
+                    self.device, probe.get('detail'), e,
+                )
+                decision = self._detect_device(load_result=False, probe=probe)
+
+        # CPU 路径：探针不可用（no_cuda）或 GPU 加载失败（load_failed）或显式 cpu
+        self._model = await asyncio.to_thread(
+            self._load_model_with_progress,
+            self.model_size,
+            'cpu',
+            CPU_COMPUTE_TYPE,
+        )
+        self._resolved_device = 'cpu'
+        self._device_reason = decision['reason']
+        if decision['reason'] == 'no_cuda' and self.device != 'cpu':
+            logger.warning(
+                "ASR 未检测到可用 CUDA，回退 CPU+int8（偏好=%s，探针: %s）",
+                self.device, probe.get('detail'),
+            )
+        else:
+            logger.info("ASR 使用 CPU+int8（reason=%s）", decision['reason'])
 
     def _load_model_with_progress(self, model_size: str, device: str, compute_type: str):
         """
@@ -258,16 +318,52 @@ class ASREngine:
             finally:
                 self._switching = False
 
+    async def change_device(self, device: str):
+        """
+        切换推理设备（与 change_model 共用 _switch_lock，同值幂等）
+
+        Args:
+            device: 'auto' | 'cpu' | 'cuda'
+
+        Raises:
+            ValueError: 设备值不受支持
+        """
+        if device not in VALID_DEVICES:
+            raise ValueError(f"不支持的设备: {device}，支持: {VALID_DEVICES}")
+
+        if device == self.device and self._initialized:
+            logger.info(f"ASR 设备偏好已是 {device}（实际 {self._resolved_device}）")
+            return
+
+        if self._switch_lock is None:
+            self._switch_lock = asyncio.Lock()
+
+        async with self._switch_lock:
+            self._switching = True
+            try:
+                logger.info(f"切换 ASR 设备: {self.device} -> {device}")
+                self.device = device
+                self._initialized = False
+                self._model = None  # 释放旧模型
+                self._resolved_device = None
+                self._device_reason = None
+
+                await self.initialize()
+            finally:
+                self._switching = False
+
     def get_model_info(self) -> dict:
         """
         获取当前模型信息
 
         Returns:
-            模型信息字典
+            模型信息字典（device=配置偏好；resolved_device/device_reason=实际结果）
         """
         return {
             'model_size': self.model_size,
             'device': self.device,
+            'resolved_device': self._resolved_device,
+            'device_reason': self._device_reason,
             'compute_type': self.compute_type,
             'initialized': self._initialized,
             'supported_models': self.SUPPORTED_MODELS

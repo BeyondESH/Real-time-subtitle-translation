@@ -16,6 +16,7 @@ export type Intent =
   | { type: 'toggleLock' }
   | { type: 'toggleOverlay' }
   | { type: 'setAudioSource'; id: string }
+  | { type: 'setDevice'; device: 'auto' | 'cpu' | 'cuda' }
   | { type: 'newSession' }
   | { type: 'showSettings' }
   | { type: 'restartBackend' };
@@ -36,6 +37,7 @@ export const WRITABLE_CONFIG_PATHS: readonly string[] = [
   'translation.targetLanguages',
   'translation.activeLanguage',
   'asr.model',
+  'inference.device',
   'audio.sourceId',
   'window.opacity',
   'window.displayId',
