@@ -1,4 +1,4 @@
-# 🎬 Real-time Subtitle Translator
+# Real-time Subtitle Translator
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -13,42 +13,42 @@
 
 ## 中文
 
-### ✨ 功能特性（2.0）
+### 功能特性（2.0）
 
-- 🖥️ **主窗口** — ChatGPT 式布局：直播字幕流、会话侧栏（今天/昨天/更早）、状态胶囊条（音频源·模型·语言·连接状态就地切换）、应用内设置页（六分段，改动即生效）
-- 🎙️ **实时音频捕获** — WASAPI 回环捕获系统音频，设备可选；多显示器：悬浮窗可指定显示器、按显示器记忆位置、越界自动回收
-- 🗣️ **语音识别** — faster-whisper + 内置 Silero VAD 切句，语句结束约 1~2.5 秒出字幕；"聆听中"实时脉冲指示
-- 🌐 **多语种翻译** — 日中专用模型 + NLLB-200 全语种（懒加载）
-- 🎨 **悬浮字幕窗** — 锁定（鼠标穿透）/解锁（拖拽）双模式、始终置顶；入场动效；暂停徽标；过载告警细条；纯文字 / 毛玻璃胶囊（Windows 11 亚克力）双外观预设
-- 📚 **会话历史** — SQLite 本地持久化：每场直播/会议一个会话，自动以首句命名；全文搜索（原文+译文）；回放定位；导出 **SRT / TXT 双语 / Markdown / JSON**（后端时间戳透传，SRT 时间轴精确）
-- ⌨️ **全局快捷键** — 暂停/恢复、切换语言、切换模型、锁定窗口；**支持自定义重录**，注册失败（被占用）在设置页可见警示
-- 🧭 **首次运行引导** — 欢迎 → 音频源选择 → 模型下载进度 → 完成（可跳过，下载转后台）
-- 🔄 **自动更新** — electron-updater + GitHub Releases：静默检查、后台下载、托盘通知重启安装（可推迟到退出时自动安装）
-- ⚙️ **开机自启** — 系统登录项实装，状态与系统真实状态自动校准
-- 🌗 **暗/亮双主题** — 暗色优先，可跟随系统，含 WCO 原生标题栏按钮配色同步
-- 📦 **离线可用** — 模型本地运行，首次自动下载，之后无需网络
-- 🏗️ **架构**（2.0 重构）— 主进程唯一 WebSocket Gateway（指数退避重连）+ AppState 单一状态机（托盘/快捷键/UI 三源一致）+ 配置单一真相（electron-store），窗口只是显示器
+- **主窗口** — ChatGPT 式布局：直播字幕流、会话侧栏（今天/昨天/更早）、状态胶囊条（音频源·模型·语言·连接状态就地切换）、应用内设置页（六分段，改动即生效）
+- **实时音频捕获** — WASAPI 回环捕获系统音频，设备可选；多显示器：悬浮窗可指定显示器、按显示器记忆位置、越界自动回收
+- **语音识别** — faster-whisper + 内置 Silero VAD 切句，语句结束约 1~2.5 秒出字幕；"聆听中"实时脉冲指示
+- **多语种翻译** — 日中专用模型 + NLLB-200 全语种（懒加载）
+- **悬浮字幕窗** — 锁定（鼠标穿透）/解锁（拖拽）双模式、始终置顶；入场动效；暂停徽标；过载告警细条；纯文字 / 毛玻璃胶囊（Windows 11 亚克力）双外观预设
+- **会话历史** — SQLite 本地持久化：每场直播/会议一个会话，自动以首句命名；全文搜索（原文+译文）；回放定位；导出 **SRT / TXT 双语 / Markdown / JSON**（后端时间戳透传，SRT 时间轴精确）
+- **全局快捷键** — 暂停/恢复、切换语言、切换模型、锁定窗口；**支持自定义重录**，注册失败（被占用）在设置页可见警示
+- **首次运行引导** — 欢迎 → 音频源选择 → 模型下载进度 → 完成（可跳过，下载转后台）
+- **自动更新** — electron-updater + GitHub Releases：静默检查、后台下载、托盘通知重启安装（可推迟到退出时自动安装）
+- **开机自启** — 系统登录项实装，状态与系统真实状态自动校准
+- **暗/亮双主题** — 暗色优先，可跟随系统，含 WCO 原生标题栏按钮配色同步
+- **离线可用** — 模型本地运行，首次自动下载，之后无需网络
+- **架构**（2.0 重构）— 主进程唯一 WebSocket Gateway（指数退避重连）+ AppState 单一状态机（托盘/快捷键/UI 三源一致）+ 配置单一真相（electron-store），窗口只是显示器
 
-### 📸 界面预览
+### 界面预览
 
 ```
 主窗口                                          悬浮字幕窗（透明置顶）
 ┌───────────────────────────────────────────┐   ┌─────────────────────────────┐
 │ ⌂ 实时字幕翻译                      ─ □ ✕ │   │                             │
 ├──────────┬────────────────────────────────┤   │      今天天气真好啊          │
-│ ＋新会话  │  直播字幕           ⏸暂停 🔒锁 │   │      今日は天気がいいですね   │
-│ 🔍搜索    │                                │   └─────────────────────────────┘
+│ ＋新会话  │  直播字幕           暂停 锁   │   │      今日は天気がいいですね   │
+│ 搜索      │                                │   └─────────────────────────────┘
 │ 今天      │      今日は天気がいいですね     │    ↑ 纯文字预设；Win11 可切
 │ ▸生肉直播 │      今天天气真好啊             │      毛玻璃胶囊预设
 │ ▸晨会录音 │      14:32:05 · 日→中          │
 │ 昨天      │           ● ● ● 聆听中…        │
 │ ▸发布会   │  ┌──────────────────────────┐  │
-│          │  │🔊 扬声器 · base · 中 · ● 运行│ │
-│ ⚙设置 ●  │  └──────────────────────────┘  │
+│          │  │ 扬声器 · base · 中 · ● 运行  │ │
+│ 设置 ●  │  └──────────────────────────┘  │
 └──────────┴────────────────────────────────┘
 ```
 
-### 🚀 快速开始
+### 快速开始
 
 #### 系统要求
 
@@ -84,7 +84,7 @@ npm run dev
 常用命令（frontend/）：`npm run dev`（HMR）、`npm run build`、`npm run typecheck`、
 `npm test`（vitest）、`npm run pack`（免安装目录）、`npm run dist`（NSIS 安装包）。
 
-### ⌨️ 快捷键（可在 设置→快捷键 重录）
+### 快捷键（可在 设置→快捷键 重录）
 
 | 快捷键 | 功能 |
 |--------|------|
@@ -93,11 +93,11 @@ npm run dev
 | `Ctrl+Shift+M` | 轮换 Whisper 模型 |
 | `Ctrl+Shift+D` | 锁定/解锁字幕窗口（解锁后可拖拽） |
 
-### 🖱️ 系统托盘
+### 系统托盘
 
 显示主窗口 / 显示·隐藏字幕 / 暂停·恢复 / 锁定字幕位置 / 重启后端服务 / 设置 / 退出。
 
-### ⚙️ 配置职责（2.0 起双文件各司其职）
+### 配置职责（2.0 起双文件各司其职）
 
 | 配置 | 位置 | 内容 |
 |------|------|------|
@@ -126,22 +126,22 @@ translation:
 > 从 1.x 升级：旧 config.yaml 中 subtitle/system/shortcuts 段的自定义值会在升级
 > 首启时**一次性迁移**进用户偏好存储，原文件保留不改写。
 
-### 📊 模型说明
+### 模型说明
 
 | Whisper 模型 | 大小 | 速度 | 准确度 |
 |------|------|------|--------|
-| tiny | 39MB | ⚡⚡⚡⚡⚡ | ⭐⭐ |
-| base | 74MB | ⚡⚡⚡⚡ | ⭐⭐⭐ **推荐** |
-| small | 244MB | ⚡⚡⚡ | ⭐⭐⭐⭐ |
-| medium | 769MB | ⚡⚡ | ⭐⭐⭐⭐⭐ |
-| large-v3 | 1.5GB | ⭐ | ⭐⭐⭐⭐⭐ |
+| tiny | 39MB | 5/5 | 2/5 |
+| base | 74MB | 4/5 | 3/5 **推荐** |
+| small | 244MB | 3/5 | 4/5 |
+| medium | 769MB | 2/5 | 5/5 |
+| large-v3 | 1.5GB | 1/5 | 5/5 |
 
 | 翻译模型 | 用途 | 语言支持 |
 |------|------|------|
 | Helsinki-NLP/opus-mt-ja-zh | 日→中专用（启动后台预载） | 日→中 |
 | facebook/nllb-200-distilled-600M | 通用（首次用到才加载） | 200+ 语种 |
 
-### 🏗️ 项目结构
+### 项目结构
 
 ```
 Real-time-subtitle-translation/
@@ -177,7 +177,7 @@ Real-time-subtitle-translation/
 └── openspec/                    # 规格与变更（specs / changes）
 ```
 
-### 🔧 构建安装包
+### 构建安装包
 
 ```bash
 build.bat            # 发布构建（PyInstaller 后端 + NSIS 安装包）
@@ -189,7 +189,7 @@ build.bat --console  # 调试构建（后端带控制台窗口）
 自动更新元数据一致）+ `latest.yml` + `.blockmap`（差分更新）。
 发布：将这三个文件上传至 GitHub Release 即触发存量客户端自动更新。
 
-### ❓ 常见问题
+### 常见问题
 
 **没有声音捕获？** 确认正在播放音频、设置→音频里回环设备选择正确、系统未静音。
 
@@ -206,18 +206,18 @@ build.bat --console  # 调试构建（后端带控制台窗口）
 
 ## English
 
-### ✨ Features (2.0)
+### Features (2.0)
 
-- 🖥️ **Main window** — ChatGPT-style: live caption stream, session sidebar, status pill bar (audio source / model / language / connection, switch in place), in-app settings (6 sections, changes apply instantly)
-- 📚 **Session history** — local SQLite: searchable (original + translation), replay with jump-to-hit, export **SRT / bilingual TXT / Markdown / JSON** (accurate SRT timeline via backend timestamps)
-- 🎨 **Overlay** — lock (click-through) / unlock (draggable), always-on-top; entry animation; pause badge; overload strip; plain-text or **acrylic pill** preset (Windows 11)
-- 🖥️ **Multi-display** — pick a display for the overlay, per-display position memory, off-screen auto-recall
-- ⌨️ **Global shortcuts** — pause / cycle language / cycle model / toggle lock, **re-recordable** in settings with visible conflict warnings
-- 🧭 **First-run onboarding** — welcome → audio source → model download progress → done (skippable)
-- 🔄 **Auto-update** — electron-updater + GitHub Releases, silent check, background download, restart-to-install (or install on quit)
-- 🌗 **Dark/light themes** — dark-first, follow-system option, WCO native titlebar sync
-- 📦 **Offline** — local models, auto-downloaded on first run
-- 🏗️ **Architecture** — single WS Gateway in main process (exponential-backoff reconnect), single AppState machine (tray/shortcuts/UI consistent), single config source of truth
+- **Main window** — ChatGPT-style: live caption stream, session sidebar, status pill bar (audio source / model / language / connection, switch in place), in-app settings (6 sections, changes apply instantly)
+- **Session history** — local SQLite: searchable (original + translation), replay with jump-to-hit, export **SRT / bilingual TXT / Markdown / JSON** (accurate SRT timeline via backend timestamps)
+- **Overlay** — lock (click-through) / unlock (draggable), always-on-top; entry animation; pause badge; overload strip; plain-text or **acrylic pill** preset (Windows 11)
+- **Multi-display** — pick a display for the overlay, per-display position memory, off-screen auto-recall
+- **Global shortcuts** — pause / cycle language / cycle model / toggle lock, **re-recordable** in settings with visible conflict warnings
+- **First-run onboarding** — welcome → audio source → model download progress → done (skippable)
+- **Auto-update** — electron-updater + GitHub Releases, silent check, background download, restart-to-install (or install on quit)
+- **Dark/light themes** — dark-first, follow-system option, WCO native titlebar sync
+- **Offline** — local models, auto-downloaded on first run
+- **Architecture** — single WS Gateway in main process (exponential-backoff reconnect), single AppState machine (tray/shortcuts/UI consistent), single config source of truth
 
 ### Requirements
 
@@ -238,10 +238,10 @@ npm run dev                                  # backend auto-spawned
 
 > **SmartScreen**: the installer is unsigned; choose "More info → Run anyway" or verify the published hash.
 
-### 📄 License
+### License
 
 MIT License
 
 ---
 
-**⭐ Star this repo if you find it useful!**
+**Star this repo if you find it useful!**
