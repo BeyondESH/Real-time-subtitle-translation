@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planLegacyYamlMigration, runLegacyYamlMigration, CONFIG_DEFAULTS, resolveAudioSection, audioSourceLabel, audioSourceKey, sameAudioSource, type MigrationEntry } from '../config-migration';
+import { planLegacyYamlMigration, runLegacyYamlMigration, CONFIG_DEFAULTS, resolveAsrSection, resolveAudioSection, audioSourceLabel, audioSourceKey, sameAudioSource, type MigrationEntry } from '../config-migration';
 import { DEFAULT_AUDIO_SOURCE, WRITABLE_CONFIG_PATHS } from '../../shared/ipc-types';
 
 const LEGACY_YAML = `
@@ -62,6 +62,51 @@ describe('翻译模型配置（replace-translation-engine-with-llamacpp D9）', 
 
   it("WRITABLE_CONFIG_PATHS 含 'translation.model'", () => {
     expect(WRITABLE_CONFIG_PATHS).toContain('translation.model');
+  });
+});
+
+describe('源语言配置（replace-asr-engine-with-funasr-nano）', () => {
+  it('默认 asr.language = ja，快捷键集不含 switchModel（档位随引擎替换移除）', () => {
+    expect(CONFIG_DEFAULTS.asr).toEqual({ language: 'ja' });
+    expect(CONFIG_DEFAULTS.shortcuts).toEqual({
+      togglePause: 'Ctrl+Shift+Space',
+      switchLanguage: 'Ctrl+Shift+L',
+      toggleLock: 'Ctrl+Shift+D'
+    });
+    expect(CONFIG_DEFAULTS.shortcutStatus).toEqual({
+      togglePause: true, switchLanguage: true, toggleLock: true
+    });
+  });
+
+  it("WRITABLE_CONFIG_PATHS 含 'asr.language' 且不含旧 'asr.model'", () => {
+    expect(WRITABLE_CONFIG_PATHS).toContain('asr.language');
+    expect(WRITABLE_CONFIG_PATHS).toContain('asr');
+    expect(WRITABLE_CONFIG_PATHS).not.toContain('asr.model');
+  });
+
+  it('合法语言原样返回且 changed=false', () => {
+    expect(resolveAsrSection({ language: 'zh' })).toEqual({ language: 'zh', changed: false });
+    expect(resolveAsrSection({ language: 'en' })).toEqual({ language: 'en', changed: false });
+  });
+
+  it('旧 Whisper 档位字段（model/model_size）→ 移除并初始化默认 ja，changed=true', () => {
+    expect(resolveAsrSection({ model: 'base' })).toEqual({ language: 'ja', changed: true });
+    expect(resolveAsrSection({ model: 'large-v3' })).toEqual({ language: 'ja', changed: true });
+    expect(resolveAsrSection({ model_size: 'small' })).toEqual({ language: 'ja', changed: true });
+  });
+
+  it('非法语言值 → 回退默认 ja，changed=true', () => {
+    expect(resolveAsrSection({ language: 'fr' })).toEqual({ language: 'ja', changed: true });
+    expect(resolveAsrSection({ language: 123 })).toEqual({ language: 'ja', changed: true });
+    expect(resolveAsrSection(undefined)).toEqual({ language: 'ja', changed: true });
+  });
+
+  it('迁移幂等：规范化后的结果再次传入不再变更', () => {
+    const first = resolveAsrSection({ model: 'base' });
+    expect(first.changed).toBe(true);
+    expect(resolveAsrSection({ language: first.language })).toEqual({
+      language: 'ja', changed: false
+    });
   });
 });
 
@@ -176,6 +221,19 @@ system:
     expect(plan).not.toBeNull();
     expect(plan!.entries.length).toBe(0);
     expect(plan!.notes.some((n) => n.includes('minimize_to_tray'))).toBe(true);
+  });
+
+  it('旧 switch_model 快捷键随档位移除：不产出 entry，记入 notes', () => {
+    const plan = planLegacyYamlMigration(`
+shortcuts:
+  switch_model: "Ctrl+Alt+M"
+  toggle_pause: "Ctrl+Alt+Space"
+`);
+    expect(plan).not.toBeNull();
+    const keys = plan!.entries.map((e) => e.key);
+    expect(keys).toContain('shortcuts.togglePause');
+    expect(keys).not.toContain('shortcuts.switchModel');
+    expect(plan!.notes.some((n) => n.includes('switch_model'))).toBe(true);
   });
 });
 
