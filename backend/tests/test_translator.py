@@ -71,16 +71,23 @@ class ChatServer:
         item = self.responses.pop(0) if self.responses else self.default
         if isinstance(item, Exception):
             raise item
+        tps = None
         if isinstance(item, tuple):
-            content, finish = item
+            if len(item) == 3:
+                content, finish, tps = item
+            else:
+                content, finish = item
         else:
             content, finish = item, 'stop'
-        return httpx.Response(200, json={
+        body = {
             'choices': [{
                 'message': {'content': content},
                 'finish_reason': finish,
             }]
-        })
+        }
+        if tps is not None:
+            body['timings'] = {'predicted_per_second': tps}
+        return httpx.Response(200, json=body)
 
 
 class Env:
@@ -118,18 +125,20 @@ def env(monkeypatch, tmp_path):
 
 
 def make(env, *, config=None, device='cpu', manager=None, responses=None,
-         default='ok'):
-    """构造 Translator + FakeManager + ChatServer"""
+         default='ok', stream=False):
+    """构造 Translator + FakeManager + ChatServer
+
+    stream 默认 False：既有整段契约用例保持逐字节旧行为；流式用例显式传
+    stream=True / stream=None（None=不注入键，验证声明默认值 True）。
+    """
     chat = ChatServer(responses, default=default)
     client = httpx.AsyncClient(transport=httpx.MockTransport(chat.handler))
     mgr = manager if manager is not None else FakeManager()
-    cfg = {
-        'translation': {
-            'device': device,
-            'target_languages': ['zh'],
-            **(config or {}),
-        }
-    }
+    translation_cfg = {'device': device, 'target_languages': ['zh']}
+    if stream is not None:
+        translation_cfg['stream'] = stream
+    translation_cfg.update(config or {})
+    cfg = {'translation': translation_cfg}
     tr = Translator(cfg, manager=mgr, client=client, cache_root=env.tmp_path)
     return tr, mgr, chat
 
@@ -144,6 +153,127 @@ def make_ready(env, *, resolved='cpu', device='cpu', **kwargs):
     mgr.is_ready = True
     mgr.model_path = model_path(tr._model, tr.cache_root)
     return tr, mgr, chat
+
+
+# --------------------------------------------------------------------- #
+# 流式替身（SSE 帧脚本）
+# --------------------------------------------------------------------- #
+
+class FakeClock:
+    """可控单调时钟：monotonic() 返回当前值，tick() 前进（供节流用例）"""
+
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def tick(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def delta_frame(content: str) -> dict:
+    """SSE 内容增量帧（delta.content）"""
+    return {'choices': [{'delta': {'content': content}, 'finish_reason': None}]}
+
+
+def role_frame() -> dict:
+    """首帧：仅 role、content 为 null（应忽略）"""
+    return {'choices': [{'delta': {'role': 'assistant', 'content': None},
+                         'finish_reason': None}]}
+
+
+def final_frame(finish: str = 'stop', tps=None) -> dict:
+    """终帧：finish_reason 非空（可带 timings）"""
+    frame = {'choices': [{'delta': {}, 'finish_reason': finish}]}
+    if tps is not None:
+        frame['timings'] = {'predicted_per_second': tps}
+    return frame
+
+
+class StreamChatServer:
+    """流式假 llama-server：按脚本产出 SSE 帧。
+
+    脚本元素：dict=数据帧；str=原始行（注释/空行/`[DONE]`/坏 JSON）；
+    Exception=在流中抛出（模拟读取期异常）。
+    """
+
+    def __init__(self, scripts=None, default=None, clock=None, frame_step=0.0):
+        self.scripts = list(scripts or [])
+        self.default = (
+            default if default is not None
+            else [delta_frame('你好'), final_frame('stop', 42.0)]
+        )
+        self.calls = 0
+        self.requests = []
+        self.handler_error = None
+        self.status_code = 200
+        self.clock = clock
+        self.frame_step = frame_step
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
+        self.requests.append(json.loads(request.content))
+        if self.handler_error is not None:
+            err = self.handler_error
+            self.handler_error = None
+            raise err
+        script = self.scripts.pop(0) if self.scripts else self.default
+        items = list(script)
+
+        async def gen():
+            for item in items:
+                if isinstance(item, Exception):
+                    raise item
+                if self.clock is not None:
+                    self.clock.tick(self.frame_step)
+                if isinstance(item, str):
+                    yield (item + '\n').encode('utf-8')
+                else:
+                    payload = json.dumps(item, ensure_ascii=False)
+                    yield ('data: ' + payload + '\n\n').encode('utf-8')
+            yield b'data: [DONE]\n\n'
+
+        return httpx.Response(self.status_code, content=gen())
+
+
+def make_stream(env, *, config=None, device='cpu', manager=None, scripts=None,
+                default=None, clock=None, frame_step=0.0, stream=True):
+    """构造流式 Translator + FakeManager + StreamChatServer"""
+    server = StreamChatServer(
+        scripts, default=default, clock=clock, frame_step=frame_step
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(server.handler))
+    mgr = manager if manager is not None else FakeManager()
+    translation_cfg = {'device': device, 'target_languages': ['zh'], 'stream': stream}
+    translation_cfg.update(config or {})
+    tr = Translator(
+        {'translation': translation_cfg}, manager=mgr, client=client,
+        cache_root=env.tmp_path,
+    )
+    return tr, mgr, server
+
+
+def make_stream_ready(env, *, resolved='cpu', device='cpu', **kwargs):
+    """已初始化且 server 就绪的流式 Translator"""
+    tr, mgr, server = make_stream(env, device=device, **kwargs)
+    tr._initialized = True
+    tr._resolved_device = resolved
+    tr._device_reason = 'user' if resolved == 'cpu' else 'auto'
+    mgr.is_running = True
+    mgr.is_ready = True
+    mgr.model_path = model_path(tr._model, tr.cache_root)
+    return tr, mgr, server
+
+
+def collect_partials():
+    """返回 (list, callback)：callback 记录 (目标语言, 累积译文, 首帧标志)"""
+    seen = []
+
+    async def on_partial(tgt: str, text: str, is_first: bool) -> None:
+        seen.append((tgt, text, is_first))
+
+    return seen, on_partial
 
 
 # --------------------------------------------------------------------- #
@@ -163,6 +293,35 @@ class TestTranslateRouting:
         assert req['messages'][0]['content'].startswith('将以下文本翻译为简体中文')
         assert 'こんにちは' in req['messages'][0]['content']
         assert 'chat_template_kwargs' not in req
+
+    async def test_success_carries_tps_metric(self, env):
+        """translate_with_metrics：timings.predicted_per_second → tps 指标"""
+        tr, mgr, chat = make_ready(env, responses=[('你好', 'stop', 46.47)])
+        results, metrics = await tr.translate_with_metrics('こんにちは', 'ja')
+        assert results == {'zh': '你好'}
+        assert metrics == {'zh': pytest.approx(46.47)}
+
+    async def test_missing_timings_no_metric(self, env):
+        """响应缺失 timings → 无指标，翻译结果不受影响"""
+        tr, mgr, chat = make_ready(env, responses=['你好'])
+        results, metrics = await tr.translate_with_metrics('こんにちは', 'ja')
+        assert results == {'zh': '你好'}
+        assert metrics == {}
+
+    @pytest.mark.parametrize('bad', ['fast', 0, -1.5, True])
+    async def test_invalid_timings_no_metric(self, env, bad):
+        """timings 字段非数值/非正数 → 一律不产生指标"""
+        tr, mgr, chat = make_ready(env, responses=[('你好', 'stop', bad)])
+        results, metrics = await tr.translate_with_metrics('こんにちは', 'ja')
+        assert results == {'zh': '你好'}
+        assert metrics == {}
+
+    async def test_unsupported_pair_has_no_metric(self, env):
+        """未支持语言对（占位串）不产生指标"""
+        tr, mgr, chat = make_ready(env, config={'target_languages': ['xx']})
+        results, metrics = await tr.translate_with_metrics('text', 'ja')
+        assert '未支持的语言对' in results['xx']
+        assert metrics == {}
 
     async def test_same_language_skipped(self, env):
         tr, mgr, chat = make_ready(env)
@@ -243,6 +402,24 @@ class TestDegenerateRetry:
         assert first['repetition_penalty'] == pytest.approx(1.05)
         assert second['repetition_penalty'] == pytest.approx(1.3)
 
+    async def test_retry_metric_uses_successful_attempt(self, env):
+        """退化重试：指标取最终成功那一次生成的 tps，而非被丢弃的首次"""
+        tr, mgr, chat = make_ready(
+            env, responses=[('你好' * 30, 'stop', 11.0), ('你好', 'stop', 42.0)]
+        )
+        results, metrics = await tr.translate_with_metrics('こんにちは', 'ja')
+        assert results == {'zh': '你好'}
+        assert metrics == {'zh': pytest.approx(42.0)}
+
+    async def test_persistent_degenerate_has_no_metric(self, env):
+        """两次均退化 → 占位串且无指标"""
+        tr, mgr, chat = make_ready(
+            env, responses=[('你好' * 30, 'stop', 11.0), ('你好' * 30, 'stop', 12.0)]
+        )
+        results, metrics = await tr.translate_with_metrics('こんにちは', 'ja')
+        assert results == {'zh': FAILURE_PLACEHOLDER}
+        assert metrics == {}
+
     async def test_max_tokens_hit_is_degenerate(self, env):
         tr, mgr, chat = make_ready(
             env, responses=[('你好' * 30, 'length'), '你好']
@@ -280,6 +457,15 @@ class TestRuntimeHealth:
         results = await tr.translate('こんにちは', 'ja')
         assert results == {'zh': FAILURE_PLACEHOLDER}
         assert tr._consecutive_failures == 1
+
+    async def test_failed_request_has_no_metric(self, env):
+        """请求失败 → 占位串且不产生指标"""
+        tr, mgr, chat = make_ready(
+            env, responses=[httpx.ReadTimeout('simulated timeout')]
+        )
+        results, metrics = await tr.translate_with_metrics('こんにちは', 'ja')
+        assert results == {'zh': FAILURE_PLACEHOLDER}
+        assert metrics == {}
 
     async def test_persistent_failure_event_on_cpu(self, env):
         health = []
@@ -369,6 +555,22 @@ class TestEnsureDefault:
         assert [s.n_gpu_layers for s in mgr.starts] == [99, 0]
         assert tr.resolved_device == 'cpu'
         assert tr.device_reason == 'load_failed'
+
+    async def test_warmup_stream_enabled_keeps_gpu(self, env):
+        """回归（add-llm-streaming-output 真机实测发现）：stream=True 时热身
+        必须走 SSE 链路；若误用非流式解析会失败并把 GPU 误判为 load_failed
+        而静默降级 CPU。"""
+        env.cuda = True
+        tr, mgr, server = make_stream(
+            env, device='cuda',
+            default=[role_frame(), delta_frame('ok'), final_frame('stop', 42.0)],
+        )
+        await tr.initialize()
+        await tr.ensure_default()
+
+        assert [s.n_gpu_layers for s in mgr.starts] == [99]
+        assert tr.resolved_device == 'cuda'
+        assert server.requests[0]['stream'] is True
 
     async def test_new_default_model_key_shapes_cpu(self, env):
         tr, mgr, chat = make(env, config={'n_ctx': 2048})
@@ -534,3 +736,274 @@ class TestConfigAndInfo:
         await tr.stop()
         assert mgr.stop_calls == 1
         assert tr._client is None
+
+
+# --------------------------------------------------------------------- #
+# 流式：SSE 解析
+# --------------------------------------------------------------------- #
+
+class TestStreamSseParsing:
+    async def test_parses_frames_skipping_noise_and_bad_json(self, env):
+        """保活注释/空行/坏 JSON 帧全部跳过，内容累积、终帧 finish/timings 生效"""
+        script = [
+            role_frame(),          # 首帧 role/null content 忽略
+            ': keep-alive',        # 保活注释行
+            '',                    # 空行
+            delta_frame('你好'),
+            'data: {bad json',     # 单帧解析失败不中断
+            'data: 123',           # 合法 JSON 但非对象，同样跳过
+            delta_frame('世界'),
+            final_frame('stop', 55.5),
+        ]
+        tr, mgr, server = make_stream_ready(env, scripts=[script])
+        deltas = []
+
+        async def on_delta(accumulated):
+            deltas.append(accumulated)
+
+        content, finish, tps = await tr._request_chat_stream(
+            'こんにちは', '简体中文', on_delta=on_delta
+        )
+        assert content == '你好世界'
+        assert finish == 'stop'
+        assert tps == pytest.approx(55.5)
+        assert deltas == ['你好', '你好世界']
+        assert server.requests[0]['stream'] is True
+
+    async def test_done_terminates_before_later_frames(self, env):
+        script = [delta_frame('你好'), 'data: [DONE]', delta_frame('后面')]
+        tr, mgr, server = make_stream_ready(env, scripts=[script])
+        content, finish, tps = await tr._request_chat_stream('x', '简体中文')
+        assert content == '你好'
+        assert finish is None
+        assert tps is None
+
+    async def test_missing_timings_returns_none(self, env):
+        script = [delta_frame('你好'), final_frame('stop')]
+        tr, mgr, server = make_stream_ready(env, scripts=[script])
+        content, finish, tps = await tr._request_chat_stream('x', '简体中文')
+        assert content == '你好'
+        assert finish == 'stop'
+        assert tps is None
+
+
+# --------------------------------------------------------------------- #
+# 流式：持有缓冲（hold-back）
+# --------------------------------------------------------------------- #
+
+class TestStreamHoldBack:
+    async def test_fence_not_pushed_until_release(self, env):
+        """markdown 围栏未闭合期间不推送；遇终止标点释放后首帧即净化内容"""
+        script = [
+            delta_frame('```'),
+            delta_frame('\n你'),
+            delta_frame('好'),
+            delta_frame('世界'),
+            delta_frame('！'),
+            final_frame('stop'),
+        ]
+        tr, mgr, server = make_stream_ready(env, scripts=[script])
+        seen, on_partial = collect_partials()
+        results, _ = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': '你好世界！'}
+        assert [t for _, t, _ in seen] == ['你好世界！']
+        assert seen[0][2] is True  # attempt 0 首次推送 = 首帧
+
+    async def test_prefix_not_pushed_until_release(self, env):
+        """'Translation:' 前缀期间不推送（净化后仍不足阈值）；释放后推送净化文本"""
+        script = [
+            delta_frame('Transl'),
+            delta_frame('ation:'),
+            delta_frame('你好'),
+            delta_frame('世界'),
+            delta_frame('你好'),
+            delta_frame('世界'),
+            final_frame('stop'),
+        ]
+        tr, mgr, server = make_stream_ready(env, scripts=[script])
+        seen, on_partial = collect_partials()
+        results, _ = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': '你好世界你好世界'}
+        assert [t for _, t, _ in seen] == ['你好世界你好世界']
+        assert all('Translation' not in t for _, t, _ in seen)
+
+
+# --------------------------------------------------------------------- #
+# 流式：节流合帧
+# --------------------------------------------------------------------- #
+
+LONG_CN = '你好世界一二三四五六七八九十甲乙丙丁戊己庚辛'  # 22 个互异字符
+
+
+class TestStreamThrottle:
+    async def test_char_based_coalescing(self, env, monkeypatch):
+        """时间未到但按字符增量合帧：推送次数显著少于增量数"""
+        monkeypatch.setattr(tr_mod, '_STREAM_MIN_INTERVAL_MS', 10_000_000)
+        clock = FakeClock()
+        monkeypatch.setattr(tr_mod, 'time', clock)
+        script = [delta_frame(ch) for ch in LONG_CN] + [final_frame('stop')]
+        tr, mgr, server = make_stream_ready(env, scripts=[script])
+        seen, on_partial = collect_partials()
+        results, _ = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': LONG_CN}
+        assert 0 < len(seen) < len(LONG_CN)
+        assert [t for _, t, _ in seen][-1] == LONG_CN
+
+    async def test_time_based_immediate_push(self, env, monkeypatch):
+        """每帧间隔 ≥ 节流窗口：逐增量即时推送"""
+        monkeypatch.setattr(tr_mod, '_STREAM_MIN_INTERVAL_MS', 50)
+        monkeypatch.setattr(tr_mod, '_STREAM_MIN_CHARS', 10 ** 9)
+        clock = FakeClock()
+        monkeypatch.setattr(tr_mod, 'time', clock)
+        script = [delta_frame(ch) for ch in LONG_CN] + [final_frame('stop')]
+        tr, mgr, server = make_stream_ready(
+            env, scripts=[script], clock=clock, frame_step=0.1
+        )
+        seen, on_partial = collect_partials()
+        results, _ = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': LONG_CN}
+        # 释放点（第 8 字符）起每个增量各推一帧
+        assert len(seen) == len(LONG_CN) - 7
+        assert [t for _, t, _ in seen][-1] == LONG_CN
+
+    async def test_final_partial_forced_before_finalize(self, env):
+        """留有余量：末帧强制推送完整净化文本（即使未达节流窗口）"""
+        script = [
+            delta_frame('你好世界'),   # len 4 < 8，不释放
+            final_frame('stop'),
+        ]
+        tr, mgr, server = make_stream_ready(env, scripts=[script])
+        seen, on_partial = collect_partials()
+        results, _ = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': '你好世界'}
+        # 未达持有阈值且无终止标点 → 释放失败，不推送
+        assert seen == []
+
+
+# --------------------------------------------------------------------- #
+# 流式：复读前移止损与可见重写
+# --------------------------------------------------------------------- #
+
+class TestStreamRewrite:
+    async def test_repeat_loop_abort_then_visible_rewrite(self, env):
+        attempt0 = [
+            delta_frame('你好' * 10),
+            delta_frame('你好' * 10),  # 累积触发复读 → 立即中止
+            delta_frame('你好' * 10),
+            final_frame('stop', 11.0),
+        ]
+        attempt1 = [
+            delta_frame('你好世界。'),
+            final_frame('stop', 42.0),
+        ]
+        tr, mgr, server = make_stream_ready(env, scripts=[attempt0, attempt1])
+        seen, on_partial = collect_partials()
+        results, metrics = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': '你好世界。'}
+        assert metrics == {'zh': pytest.approx(42.0)}
+        assert server.calls == 2
+        assert server.requests[0]['repetition_penalty'] == pytest.approx(1.05)
+        assert server.requests[1]['repetition_penalty'] == pytest.approx(1.3)
+        texts = [t for _, t, _ in seen]
+        assert texts[0].startswith('你好')      # 第一遍已推送内容
+        assert texts[-1] == '你好世界。'          # 第二遍替换 = 可见重写
+        assert texts[-1] != texts[0]
+        assert tr._consecutive_failures == 0
+
+    async def test_repeat_loop_both_attempts_placeholder(self, env):
+        script = [
+            delta_frame('你好' * 10),
+            delta_frame('你好' * 10),
+            final_frame('stop', 9.0),
+        ]
+        tr, mgr, server = make_stream_ready(env, scripts=[script, script])
+        seen, on_partial = collect_partials()
+        results, metrics = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': FAILURE_PLACEHOLDER}
+        assert metrics == {}
+        assert server.calls == 2
+        assert tr._consecutive_failures == 0  # 退化不算引擎健康失败
+
+
+# --------------------------------------------------------------------- #
+# 流式：关流回退与默认值
+# --------------------------------------------------------------------- #
+
+class TestStreamFallback:
+    async def test_disabled_uses_blocking_path_no_partials(self, env):
+        tr, mgr, chat = make_ready(env, stream=False, responses=['你好'])
+        seen, on_partial = collect_partials()
+        results, metrics = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': '你好'}
+        assert metrics == {}
+        assert seen == []
+        assert chat.requests[0]['stream'] is False
+        assert tr._stream_enabled is False
+
+    async def test_default_true_when_key_absent(self, env):
+        tr, mgr, chat = make(env, stream=None)
+        assert tr._stream_enabled is True
+
+    async def test_build_payload_stream_flag(self, env):
+        tr_on, _, _ = make(env, stream=True)
+        tr_off, _, _ = make(env, stream=False)
+        assert tr_on._build_payload('x', '简体中文', None, 64)['stream'] is True
+        assert tr_off._build_payload('x', '简体中文', None, 64)['stream'] is False
+
+
+# --------------------------------------------------------------------- #
+# 流式：异常 / 超时路径
+# --------------------------------------------------------------------- #
+
+class TestStreamFailure:
+    async def test_request_error_placeholder(self, env):
+        tr, mgr, server = make_stream_ready(env)
+        server.handler_error = httpx.ReadTimeout('simulated timeout')
+        seen, on_partial = collect_partials()
+        results, metrics = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': FAILURE_PLACEHOLDER}
+        assert metrics == {}
+        assert seen == []
+        assert tr._consecutive_failures == 1
+
+    async def test_http_error_placeholder(self, env):
+        tr, mgr, server = make_stream_ready(env)
+        server.status_code = 500
+        seen, on_partial = collect_partials()
+        results, metrics = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': FAILURE_PLACEHOLDER}
+        assert metrics == {}
+        assert seen == []
+        assert tr._consecutive_failures == 1
+
+    async def test_midstream_timeout_placeholder_after_partials(self, env):
+        script = [delta_frame('你好世界！'), httpx.ReadTimeout('mid-stream timeout')]
+        tr, mgr, server = make_stream_ready(env, scripts=[script])
+        seen, on_partial = collect_partials()
+        results, metrics = await tr.translate_with_metrics(
+            'こんにちは', 'ja', on_partial=on_partial
+        )
+        assert results == {'zh': FAILURE_PLACEHOLDER}
+        assert metrics == {}
+        assert [t for _, t, _ in seen] == ['你好世界！']  # 已推部分帧
+        assert tr._consecutive_failures == 1

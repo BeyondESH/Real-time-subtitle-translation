@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 渲染进程桥类型（window.appAPI / window.electronAPI 的本地结构声明）
  * 与主进程 AppState/AppConfig 结构对齐；contextBridge 序列化边界，渲染层不 import 主进程模块。
  */
@@ -52,9 +52,7 @@ interface SubtitleStyleView {
 }
 
 /** 音频源偏好（渲染边界本地声明，与主进程 AudioSourcePref 结构对齐） */
-type AudioSourcePrefView =
-  | { kind: 'device'; id: string }
-  | { kind: 'process'; name: string; lastPid: number | null };
+type AudioSourcePrefView = { kind: 'device'; id: string };
 
 interface AppConfigView {
   window: {
@@ -71,18 +69,17 @@ interface AppConfigView {
   shortcuts: {
     togglePause: string;
     switchLanguage: string;
-    switchModel: string;
     toggleLock: string;
   };
   /** 全局快捷键注册状态（false=被占用，设置页警示） */
   shortcutStatus: {
     togglePause: boolean;
     switchLanguage: boolean;
-    switchModel: boolean;
     toggleLock: boolean;
   };
   translation: { targetLanguages: string[]; activeLanguage: string; model: string };
-  asr: { model: string };
+  /** 源语言偏好（识别提示 + 翻译源语言；识别引擎为 Fun-ASR-Nano 单模型） */
+  asr: { language: 'ja' | 'zh' | 'en' };
   /** 推理设备偏好（auto/cpu/cuda） */
   inference: { device: 'auto' | 'cpu' | 'cuda' };
   /** 音频源偏好（结构化：设备源或按进程源） */
@@ -106,7 +103,44 @@ interface SubtitleMessageView {
   translations: Record<string, string>;
   ts_start?: number;
   ts_end?: number;
+  /** LLM 生成速度（tok/s）；缺失（翻译失败/旧后端）时脚注不显示 */
+  tps?: number;
+  /** 分阶段耗时（毫秒，非负整数；全有或全无）；缺失（兼容路径/旧后端）时脚注不显示 */
+  latency?: {
+    endpoint_ms: number;
+    queue_ms: number;
+    asr_ms: number;
+    llm_ms: number;
+    total_ms: number;
+  };
+  /** 语句标识（add-llm-streaming-output）；旧后端缺失 */
+  id?: string;
+  /** 切句→首个进行中帧时延（毫秒，非负整数）；非流式/旧后端缺失 */
+  first_token_ms?: number;
 }
+
+/** 进行中帧（add-llm-streaming-output；MUST NOT 落库） */
+interface SubtitlePartialMessageView {
+  type: 'subtitle_partial';
+  id: string;
+  original: string;
+  source_language: string;
+  active_language: string;
+  translations: Record<string, string>;
+}
+
+/** 清算帧（add-llm-streaming-output）：reason 开放，未知值容错 */
+interface SubtitleCancelMessageView {
+  type: 'subtitle_cancel';
+  id: string;
+  reason?: string;
+}
+
+/** 字幕流事件（进行中 / 清算 / 定稿）：app:subtitle 通道载荷联合 */
+type SubtitleStreamEventView =
+  | SubtitleMessageView
+  | SubtitlePartialMessageView
+  | SubtitleCancelMessageView;
 
 interface ToastView {
   text: string;
@@ -193,7 +227,7 @@ interface AppAPI {
   onStatePatch(cb: (patch: Partial<AppStateView>) => void): Unsubscribe;
   getConfig(): Promise<AppConfigView>;
   onConfigChanged(cb: (config: AppConfigView) => void): Unsubscribe;
-  onSubtitle(cb: (subtitle: SubtitleMessageView) => void): Unsubscribe;
+  onSubtitle(cb: (subtitle: SubtitleStreamEventView) => void): Unsubscribe;
   onToast(cb: (toast: ToastView) => void): Unsubscribe;
   dispatch(intent: { type: string; [key: string]: unknown }): Promise<void>;
   wsRequest(method: string, params?: unknown): Promise<WsResponseView>;

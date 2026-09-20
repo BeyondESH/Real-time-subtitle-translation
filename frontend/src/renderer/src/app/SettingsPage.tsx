@@ -6,8 +6,6 @@ import {
 } from '../components/ui';
 import { useAppConfig, useAppState, useEnv } from '../state/hooks';
 import {
-  AUDIO_APPS_EMPTY_HINT,
-  AUDIO_APPS_UNSUPPORTED_HINT,
   buildAudioSelectModel,
   buildAudioSourceList,
   decodeAudioSource,
@@ -21,6 +19,9 @@ import {
   type TranslationModelsData
 } from '../state/translation-models';
 import { ToastHost } from './ToastHost';
+import {
+  ENGINE_MODEL_DISPLAY, SOURCE_LANGUAGE_LABELS, SOURCE_LANGUAGES
+} from '../../../shared/ipc-types';
 
 const SECTIONS = [
   { value: 'general', label: '通用' },
@@ -31,13 +32,10 @@ const SECTIONS = [
   { value: 'advanced', label: '高级' }
 ];
 
-const WHISPER_MODELS = [
-  { value: 'tiny', label: 'tiny（最快）' },
-  { value: 'base', label: 'base（推荐）' },
-  { value: 'small', label: 'small（较准）' },
-  { value: 'medium', label: 'medium（准确）' },
-  { value: 'large-v3', label: 'large-v3（最准）' }
-];
+const SOURCE_LANGUAGE_OPTIONS = SOURCE_LANGUAGES.map((code) => ({
+  value: code,
+  label: `${SOURCE_LANGUAGE_LABELS[code]}（${code}）`
+}));
 
 const FONT_OPTIONS = [
   { value: 'Microsoft YaHei', label: '微软雅黑' },
@@ -77,22 +75,6 @@ export function deviceStatusText(device: AppStateView['device'] | undefined): st
     default:
       return 'CPU（用户指定）';
   }
-}
-
-/** 重档模型集（design D6）：实际 CPU 时提示降档，仅展示不代选 */
-const HEAVY_MODELS = new Set(['medium', 'large-v3']);
-
-/**
- * 实际设备为 CPU 且 ASR 模型为重档 → 降档建议文案（settings-management spec）；
- * 仅作提示，MUST NOT 自动更改用户模型选择（design D6）。
- */
-export function deviceModelAdvice(
-  device: AppStateView['device'] | undefined,
-  model: string | undefined
-): string | null {
-  if (!device || device.asr.resolved !== 'cpu') return null;
-  if (!model || !HEAVY_MODELS.has(model)) return null;
-  return '当前模型在 CPU 上难以实时，建议切换到更小模型档位';
 }
 
 const THEME_ITEMS = [
@@ -400,7 +382,7 @@ function ColorInput({ value, onChange }: { value: string; onChange(v: string): v
 
 // ---------- 音频 ----------
 
-/** 音频分段：设备 + 应用进程同源列表（add-per-process-audio-capture settings-management 增量） */
+/** 音频分段：回环设备选择（settings-management spec：实时拉取、失败可重试） */
 export function AudioSection({ cfg }: { cfg: AppConfigView }) {
   const [data, setData] = useState<AudioSourcesData | null>(null);
   const [status, setStatus] = useState<'idle' | 'loading' | 'error'>('loading');
@@ -442,7 +424,7 @@ export function AudioSection({ cfg }: { cfg: AppConfigView }) {
   return (
     <div className="max-w-xl">
       <SectionTitle>音频</SectionTitle>
-      <Row label="音频源">
+      <Row label="音频源（回环设备）">
         <span className="flex w-full items-center gap-2">
           <span className="min-w-0 flex-1">
             <Select
@@ -469,25 +451,13 @@ export function AudioSection({ cfg }: { cfg: AppConfigView }) {
           {data.deviceError && (
             <p className="text-xs text-danger">设备列表：{data.deviceError}{retry}</p>
           )}
-          {data.processError && (
-            <p className="text-xs text-danger">应用列表：{data.processError}{retry}</p>
-          )}
-          {!data.deviceError && !data.processError && (
-            <p className="text-xs text-secondary">
-              发现 {list.devices.length} 个回环设备
-              {list.appsSupported ? `，${list.apps.length} 个应用进程` : ''}
-            </p>
-          )}
-          {!data.processError && !list.appsSupported && (
-            <p className="mt-1 text-xs text-secondary opacity-60">{AUDIO_APPS_UNSUPPORTED_HINT}</p>
-          )}
-          {!data.processError && list.appsSupported && list.apps.length === 0 && (
-            <p className="mt-1 text-xs text-secondary opacity-60">{AUDIO_APPS_EMPTY_HINT}</p>
+          {!data.deviceError && (
+            <p className="text-xs text-secondary">发现 {list.devices.length} 个回环设备</p>
           )}
         </>
       )}
       {status === 'idle' && !data && (
-        <p className="text-xs text-secondary opacity-60">点击"刷新"从后端拉取设备与应用列表</p>
+        <p className="text-xs text-secondary opacity-60">点击"刷新"从后端拉取设备列表</p>
       )}
     </div>
   );
@@ -543,21 +513,28 @@ export function TranslationModelRow({ cfg }: { cfg: AppConfigView }) {
 
 export function ModelSection({ state, cfg }: { state: AppStateView | null; cfg: AppConfigView }) {
   const device = cfg.inference?.device ?? 'auto';
-  const advice = deviceModelAdvice(state?.device, state?.model);
   return (
     <div className="max-w-xl">
       <SectionTitle>模型</SectionTitle>
-      <Row label="Whisper 模型">
+      <Row label="识别引擎">
+        <span className="w-56 text-sm text-primary">{ENGINE_MODEL_DISPLAY}</span>
+      </Row>
+      <p className="mb-5 -mt-3 text-xs text-secondary opacity-60">
+        单引擎模型（sherpa-onnx，Fun-ASR-Nano INT8）；首次使用自动下载（约 948MB），进度见下方与直播流页。
+      </p>
+      <Row label="源语言">
         <span className="w-56">
           <Select
-            options={WHISPER_MODELS}
-            value={state?.model ?? 'base'}
-            onChange={(v) => void window.appAPI.dispatch({ type: 'setModel', model: v })}
+            options={SOURCE_LANGUAGE_OPTIONS}
+            value={cfg.asr.language}
+            onChange={(v) => void window.appAPI.dispatch({
+              type: 'setSourceLanguage', language: v as 'ja' | 'zh' | 'en'
+            })}
           />
         </span>
       </Row>
-      <p className="mb-5 text-xs text-secondary opacity-60">
-        切换立即生效；首次使用某档位会自动下载（约 40MB~1.5GB），进度见下方与直播流页。
+      <p className="mb-5 -mt-3 text-xs text-secondary">
+        识别与翻译的源语言，支持日语/中文/英文；切换热生效，失败自动回退并提示。
       </p>
       <TranslationModelRow cfg={cfg} />
       <Row label="推理设备">
@@ -572,11 +549,6 @@ export function ModelSection({ state, cfg }: { state: AppStateView | null; cfg: 
       <p className="mb-5 -mt-3 text-xs text-secondary">
         当前使用：{deviceStatusText(state?.device)}
       </p>
-      {advice && (
-        <p className="mb-5 -mt-3 text-xs text-warn">
-          {advice}
-        </p>
-      )}
       <p className="mb-5 text-xs text-secondary opacity-60">
         切换设备将重新加载模型，期间字幕可能短暂延迟。
       </p>
@@ -597,7 +569,6 @@ export function ModelSection({ state, cfg }: { state: AppStateView | null; cfg: 
 const DEFAULT_SHORTCUTS = {
   togglePause: 'Ctrl+Shift+Space',
   switchLanguage: 'Ctrl+Shift+L',
-  switchModel: 'Ctrl+Shift+M',
   toggleLock: 'Ctrl+Shift+D'
 };
 
@@ -672,7 +643,6 @@ function ShortcutsSection({ cfg }: { cfg: AppConfigView }) {
   const rows: Array<[ShortcutField, string]> = [
     ['togglePause', '暂停/恢复'],
     ['switchLanguage', '切换语言'],
-    ['switchModel', '切换模型'],
     ['toggleLock', '锁定/解锁窗口']
   ];
 

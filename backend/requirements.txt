@@ -3,13 +3,11 @@ soundcard>=0.4.5
 numpy>=1.24.0
 soxr>=0.3
 
-# Per-process audio capture (Windows 10 2004+)
-comtypes>=1.4.16
-pycaw>=20251023
-psutil>=7.2.2
-
-# ASR - faster-whisper (>=1.0 内置 Silero VAD)
-faster-whisper>=1.0
+# ASR - sherpa-onnx（Fun-ASR-Nano INT8，进程内常驻；pin 见 change 0.4 归档）
+# GPU 打包改用 CUDA 变体 wheel（+cuda12.cudnn9，k2-fsa 发布索引），见 build.spec 注释
+sherpa-onnx==1.13.8
+# VAD（内嵌 silero_vad 资产经 ONNX Runtime 加载）与 ASR CUDA provider 探针
+onnxruntime>=1.17
 
 # Translation - llama.cpp sidecar（llama-server 二进制随包分发，模型按需下载）
 httpx>=0.27

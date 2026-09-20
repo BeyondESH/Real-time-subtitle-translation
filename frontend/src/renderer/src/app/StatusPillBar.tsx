@@ -1,15 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Cpu, Languages, Mic } from 'lucide-react';
 import { Pill, StatusDot, cx } from '../components/ui';
-import type { AudioSourceTarget } from '../../../shared/ipc-types';
+import { ENGINE_MODEL_DISPLAY, type AudioSourceTarget } from '../../../shared/ipc-types';
 import { langLabel } from './lang-labels';
 import {
-  AUDIO_APPS_EMPTY_HINT,
-  AUDIO_APPS_TITLE,
-  AUDIO_APPS_UNSUPPORTED_HINT,
   AUDIO_DEVICES_EMPTY_HINT,
   AUDIO_DEVICES_TITLE,
-  AUDIO_POLL_MS,
   buildAudioSourceList,
   fetchAudioSources,
   isAudioOptionSelected,
@@ -19,9 +15,7 @@ import {
   type AudioSourcesData
 } from '../state/audio-sources';
 
-const WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large-v3'];
-
-type PanelKind = 'audio' | 'model' | 'lang' | null;
+type PanelKind = 'audio' | 'lang' | null;
 
 function connectionPresentation(state: AppStateView): {
   status: 'ok' | 'warn' | 'danger' | 'idle' | 'paused';
@@ -53,18 +47,16 @@ export function StatusPillBar({
       .then(setAudioData)
       .catch((e: unknown) => {
         const text = String(e);
-        setAudioData({ devices: null, deviceError: text, processes: null, processError: text });
+        setAudioData({ devices: null, deviceError: text });
       })
       .finally(() => setAudioLoading(false));
   }, []);
 
-  // 面板打开：拉取一次；保持打开期间每 3s 轻量轮询；关闭/切面板时清理
+  // 面板打开：拉取一次（设备热插拔低频；失败行内可重试）；关闭/切面板时清理
   useEffect(() => {
     if (panel !== 'audio') return;
     setAudioData(null);
     loadAudio();
-    const timer = window.setInterval(loadAudio, AUDIO_POLL_MS);
-    return () => window.clearInterval(timer);
   }, [panel, loadAudio]);
 
   const toggle = (kind: Exclude<PanelKind, null>): void => {
@@ -107,29 +99,6 @@ export function StatusPillBar({
                     onSelect={() => selectSource(list.system.source)}
                   />
 
-                  {/* 应用进程（supported=false 隐藏，附说明） */}
-                  {audioData.processError && (
-                    <ErrorRow text={`应用：${audioData.processError}`} onRetry={loadAudio} />
-                  )}
-                  {!audioData.processError && list.appsSupported && (
-                    <>
-                      <SectionLabel>{AUDIO_APPS_TITLE}</SectionLabel>
-                      {list.apps.length === 0
-                        ? <HintRow>{AUDIO_APPS_EMPTY_HINT}</HintRow>
-                        : list.apps.map((o) => (
-                          <DeviceItem
-                            key={o.key}
-                            label={o.label}
-                            selected={isAudioOptionSelected(pref, o)}
-                            onSelect={() => selectSource(o.source)}
-                          />
-                        ))}
-                    </>
-                  )}
-                  {!audioData.processError && !list.appsSupported && (
-                    <HintRow>{AUDIO_APPS_UNSUPPORTED_HINT}</HintRow>
-                  )}
-
                   {/* 回环设备 */}
                   {audioData.deviceError && (
                     <ErrorRow text={`设备：${audioData.deviceError}`} onRetry={loadAudio} />
@@ -155,29 +124,10 @@ export function StatusPillBar({
           )}
         </span>
 
-        {/* 模型 */}
-        <span className="relative">
-          <Pill icon={<Cpu className="h-3.5 w-3.5" />} title="Whisper 模型" onClick={() => toggle('model')}>
-            {state.model}
-          </Pill>
-          {panel === 'model' && (
-            <span className={panelClass}>
-              <span className="flex flex-col gap-0.5">
-                {WHISPER_MODELS.map((m) => (
-                  <DeviceItem
-                    key={m}
-                    label={m}
-                    selected={state.model === m}
-                    onSelect={() => {
-                      void window.appAPI.dispatch({ type: 'setModel', model: m });
-                      setPanel(null);
-                    }}
-                  />
-                ))}
-              </span>
-            </span>
-          )}
-        </span>
+        {/* 识别引擎（单引擎模型：仅展示，无切换面板；spec: main-window「状态胶囊条」） */}
+        <Pill icon={<Cpu className="h-3.5 w-3.5" />} title="识别引擎">
+          {ENGINE_MODEL_DISPLAY}
+        </Pill>
 
         {/* 语言 */}
         <span className="relative">

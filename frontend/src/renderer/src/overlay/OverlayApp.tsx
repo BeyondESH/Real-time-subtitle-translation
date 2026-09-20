@@ -8,6 +8,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause } from 'lucide-react';
+import { useTypewriterText } from '../state/hooks';
 
 const MAX_HISTORY = 5;
 const TOAST_MS = 5000;
@@ -38,7 +39,41 @@ export function warningStripText(w: WarningStrip | null): string {
 
 interface CaptionEntry {
   seq: number;
-  msg: SubtitleMessageView;
+  msg: SubtitleMessageView | SubtitlePartialMessageView;
+  /** true = 进行中（subtitle_partial）；定稿后清除 */
+  streaming?: boolean;
+}
+
+/**
+ * 字幕行：译文逐字揭示（打字机）；进行中态弱化。
+ * 抽为组件以在 map 回调外合法使用 Hook。
+ */
+function OverlayLine({
+  msg, streaming, displayMode
+}: {
+  msg: CaptionEntry['msg'];
+  streaming?: boolean;
+  displayMode: string;
+}) {
+  // 激活语言来自消息本身，前端不硬编码语言代码
+  const active = msg.active_language;
+  const translation = (active && msg.translations && msg.translations[active]) || msg.original;
+  const revealed = useTypewriterText(translation);
+  const showOriginal = displayMode === 'original_and_translation'
+    && Boolean(msg.original)
+    && msg.source_language !== active;
+  return (
+    <div className="subtitle-line caption-enter">
+      {/* 进行中态弱化（降低不透明度）；悬浮窗无 Tailwind 入口，故用无色彩的 inline opacity */}
+      <div
+        className="subtitle-translation"
+        style={streaming === true ? { opacity: 0.6 } : undefined}
+      >
+        {revealed}
+      </div>
+      {showOriginal && <div className="subtitle-original">{msg.original}</div>}
+    </div>
+  );
 }
 
 export function OverlayApp() {
@@ -104,10 +139,44 @@ export function OverlayApp() {
           }, WARN_STRIP_MS);
         }
       }),
-      window.appAPI.onSubtitle((msg) => {
-        if (pausedRef.current) return; // 暂停期间收到的字幕丢弃不渲染
+      window.appAPI.onSubtitle((ev) => {
+        if (pausedRef.current) return; // 暂停期间收到的字幕（含进行中帧）丢弃不渲染
+
+        if (ev.type === 'subtitle_cancel') {
+          // 清算：移除同 id 的进行中行（从未成为正式字幕）
+          setCaptions((prev) => {
+            const idx = prev.findIndex((e) => e.streaming === true && e.msg.id === ev.id);
+            return idx < 0 ? prev : prev.filter((_, i) => i !== idx);
+          });
+          return;
+        }
+
+        // seq 在 updater 外分配（StrictMode 会双调用 updater，避免重复自增）
+        const seq = ++seqRef.current;
+
+        if (ev.type === 'subtitle_partial') {
+          setCaptions((prev) => {
+            const idx = prev.findIndex((e) => e.streaming === true && e.msg.id === ev.id);
+            if (idx >= 0) {
+              // 原地替换：保 seq → React 不重挂载、入场动效不重放
+              const next = [...prev];
+              next[idx] = { ...next[idx], msg: ev };
+              return next;
+            }
+            // 新增进行中行且 MUST NOT 裁剪：窗口推进只由定稿触发
+            return [...prev, { seq, msg: ev, streaming: true }];
+          });
+          return;
+        }
+
+        // 定稿（subtitle）：同 id 原地替换并清标记，否则追加；窗口在定稿时裁剪
         setCaptions((prev) => {
-          const next: CaptionEntry[] = [...prev, { seq: ++seqRef.current, msg }];
+          const idx = ev.id === undefined
+            ? -1
+            : prev.findIndex((e) => e.streaming === true && e.msg.id === ev.id);
+          const next: CaptionEntry[] = idx >= 0
+            ? prev.map((e, i) => (i === idx ? { ...e, msg: ev, streaming: false } : e))
+            : [...prev, { seq, msg: ev, streaming: false }];
           return next.length > MAX_HISTORY ? next.slice(next.length - MAX_HISTORY) : next;
         });
       }),
@@ -159,20 +228,9 @@ export function OverlayApp() {
       {toast && <div className={`toast toast-${toast.kind}`}>{toast.text}</div>}
 
       <div className="subtitle-list">
-        {captions.map(({ seq, msg }) => {
-          // 激活语言来自消息本身，前端不硬编码语言代码
-          const active = msg.active_language;
-          const translation = (active && msg.translations && msg.translations[active]) || msg.original;
-          const showOriginal = displayMode === 'original_and_translation'
-            && Boolean(msg.original)
-            && msg.source_language !== active;
-          return (
-            <div className="subtitle-line caption-enter" key={seq}>
-              <div className="subtitle-translation">{translation}</div>
-              {showOriginal && <div className="subtitle-original">{msg.original}</div>}
-            </div>
-          );
-        })}
+        {captions.map(({ seq, msg, streaming }) => (
+          <OverlayLine key={seq} msg={msg} streaming={streaming} displayMode={displayMode} />
+        ))}
       </div>
     </div>
   );

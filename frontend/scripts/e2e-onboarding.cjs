@@ -59,9 +59,7 @@ async function main() {
                 translation: { resolved_device: 'cpu', device_reason: 'no_cuda' },
                 active_language: 'zh'
               }
-            : msg.method === 'get_audio_processes'
-              ? { supported: true, reason: null, processes: [] }
-              : null;
+            : null;
         ws.send(JSON.stringify({ type: 'response', id: msg.id, ok: true, result }));
       }
     });

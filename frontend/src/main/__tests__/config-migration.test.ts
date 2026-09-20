@@ -76,15 +76,16 @@ describe('音频源结构化配置（add-per-process-audio-capture D10）', () =
     expect(WRITABLE_CONFIG_PATHS).not.toContain('audio.sourceId');
   });
 
-  it('source 合法 → 原样返回且 changed=false', () => {
+  it('source 合法（设备源）→ 原样返回且 changed=false', () => {
     const device = resolveAudioSection({ source: { kind: 'device', id: 'dev-1' } });
     expect(device).toEqual({ source: { kind: 'device', id: 'dev-1' }, changed: false });
+  });
+
+  it('回退前的进程源形态 → 迁移为默认设备，changed=true', () => {
     const process = resolveAudioSection({
       source: { kind: 'process', name: 'chrome.exe', lastPid: 9 }
     });
-    expect(process).toEqual({
-      source: { kind: 'process', name: 'chrome.exe', lastPid: 9 }, changed: false
-    });
+    expect(process).toEqual({ source: { kind: 'device', id: '' }, changed: true });
   });
 
   it('旧裸字符串 sourceId → 解释为设备源（含空串默认），changed=true', () => {
@@ -122,18 +123,13 @@ describe('音频源结构化配置（add-per-process-audio-capture D10）', () =
   it('audioSourceLabel / audioSourceKey / sameAudioSource 语义', () => {
     expect(audioSourceLabel({ kind: 'device', id: '' })).toBe('');
     expect(audioSourceLabel({ kind: 'device', id: 'dev-1' })).toBe('dev-1');
-    expect(audioSourceLabel({ kind: 'process', name: 'chrome.exe', lastPid: 3 })).toBe('chrome.exe');
 
     expect(audioSourceKey({ kind: 'device', id: 'dev-1' })).toBe('device:dev-1');
-    expect(audioSourceKey({ kind: 'process', name: 'chrome.exe', lastPid: null }))
-      .toBe('process:chrome.exe');
-    // PID 变化不算换源
     expect(sameAudioSource(
-      { kind: 'process', name: 'chrome.exe', lastPid: 1 },
-      { kind: 'process', name: 'chrome.exe', lastPid: 2 }
+      { kind: 'device', id: 'dev-1' }, { kind: 'device', id: 'dev-1' }
     )).toBe(true);
     expect(sameAudioSource(
-      { kind: 'device', id: 'dev-1' }, { kind: 'process', name: 'dev-1', lastPid: null }
+      { kind: 'device', id: 'dev-1' }, { kind: 'device', id: 'dev-2' }
     )).toBe(false);
   });
 });

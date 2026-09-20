@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
-import { ModelSection, deviceStatusText, deviceModelAdvice } from '../SettingsPage';
+import { ModelSection, deviceStatusText } from '../SettingsPage';
 
 afterEach(cleanup);
 
@@ -50,7 +50,7 @@ function makeState(device: DeviceView): AppStateView {
     connection: 'open',
     capture: 'running',
     vad: 'silence',
-    model: 'base',
+    model: 'Fun-ASR-Nano',
     modelDownload: null,
     activeLanguage: 'zh',
     targetLanguages: ['zh', 'en'],
@@ -83,14 +83,13 @@ function makeConfig(device: 'auto' | 'cpu' | 'cuda'): AppConfigView {
     shortcuts: {
       togglePause: 'Ctrl+Shift+Space',
       switchLanguage: 'Ctrl+Shift+L',
-      switchModel: 'Ctrl+Shift+M',
       toggleLock: 'Ctrl+Shift+D'
     },
     shortcutStatus: {
-      togglePause: true, switchLanguage: true, switchModel: true, toggleLock: true
+      togglePause: true, switchLanguage: true, toggleLock: true
     },
     translation: { targetLanguages: ['zh', 'en'], activeLanguage: 'zh', model: 'hy-mt2-1.8b-q4km' },
-    asr: { model: 'base' },
+    asr: { language: 'ja' },
     inference: { device },
     audio: { source: { kind: 'device', id: '' } },
     locked: true,
@@ -132,25 +131,28 @@ describe('deviceStatusText（精确文案映射）', () => {
   });
 });
 
-describe('deviceModelAdvice（重档模型 × CPU 降档建议，design D6）', () => {
-  const cpu = { asr: engine('cpu', 'runtime_failed'), translation: engine(null, 'auto') };
-
-  it('CPU + medium/large-v3 → 建议降档（含各降级原因）', () => {
-    expect(deviceModelAdvice(cpu, 'medium')).toBe('当前模型在 CPU 上难以实时，建议切换到更小模型档位');
-    expect(deviceModelAdvice(cpu, 'large-v3')).toBe('当前模型在 CPU 上难以实时，建议切换到更小模型档位');
-    expect(deviceModelAdvice(
-      { asr: engine('cpu', 'no_cuda'), translation: engine(null, 'auto') }, 'medium'
-    )).toBe('当前模型在 CPU 上难以实时，建议切换到更小模型档位');
+describe('ModelSection 识别引擎与源语言（replace-asr-engine-with-funasr-nano）', () => {
+  it('识别引擎行固定展示 Fun-ASR-Nano（单引擎，无档位选择）', () => {
+    render(<ModelSection state={makeState(null)} cfg={makeConfig('auto')} />);
+    expect(screen.getByText('Fun-ASR-Nano')).not.toBeNull();
+    expect(screen.getByText(/约 948MB/)).not.toBeNull();
   });
 
-  it('非重档模型 / GPU / 检测中 → 无建议', () => {
-    expect(deviceModelAdvice(cpu, 'base')).toBeNull();
-    expect(deviceModelAdvice(cpu, 'small')).toBeNull();
-    expect(deviceModelAdvice(cpu, undefined)).toBeNull();
-    expect(deviceModelAdvice(
-      { asr: engine('cuda', 'auto'), translation: engine(null, 'auto') }, 'medium'
-    )).toBeNull();
-    expect(deviceModelAdvice(null, 'medium')).toBeNull();
+  it('源语言选择展示持久化偏好，变更派发 setSourceLanguage（改动即落盘）', () => {
+    render(<ModelSection state={makeState(null)} cfg={makeConfig('auto')} />);
+    const sourceSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    expect(sourceSelect.value).toBe('ja');
+    fireEvent.change(sourceSelect, { target: { value: 'zh' } });
+    expect(window.appAPI.dispatch).toHaveBeenCalledWith({
+      type: 'setSourceLanguage', language: 'zh'
+    });
+  });
+
+  it('源语言选项仅日语/中文/英文（识别支持范围明示）', () => {
+    render(<ModelSection state={makeState(null)} cfg={makeConfig('auto')} />);
+    const sourceSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    const values = Array.from(sourceSelect.options).map((o) => o.value);
+    expect(values).toEqual(['ja', 'zh', 'en']);
   });
 });
 
@@ -184,24 +186,15 @@ describe('ModelSection 推理设备', () => {
     expect(screen.getByText('当前使用：GPU（CUDA 自动检测）')).not.toBeNull();
   });
 
-  it('运行期不可用降级：状态行如实呈报，重档模型附降档建议且不自动改选', () => {
-    const st = makeState({ asr: engine('cpu', 'runtime_failed'), translation: engine('cpu', 'no_cuda') });
-    st.model = 'medium';
-    render(<ModelSection state={st} cfg={makeConfig('cuda')} />);
-    const modelSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    expect(modelSelect.value).toBe('medium'); // MUST NOT 自动更改用户模型选择
-    expect(screen.getByText('当前使用：CPU（GPU 运行时不可用，已自动降级）')).not.toBeNull();
-    expect(screen.getByText('当前模型在 CPU 上难以实时，建议切换到更小模型档位')).not.toBeNull();
-  });
-
-  it('轻档模型 CPU 时不显示降档建议', () => {
+  it('运行期不可用降级：状态行如实呈报（无档位建议文案）', () => {
     render(
       <ModelSection
         state={makeState({ asr: engine('cpu', 'runtime_failed'), translation: engine('cpu', 'no_cuda') })}
         cfg={makeConfig('cuda')}
       />
     );
-    expect(screen.queryByText('当前模型在 CPU 上难以实时，建议切换到更小模型档位')).toBeNull();
+    expect(screen.getByText('当前使用：CPU（GPU 运行时不可用，已自动降级）')).not.toBeNull();
+    expect(screen.queryByText(/建议切换到更小模型档位/)).toBeNull();
   });
 });
 

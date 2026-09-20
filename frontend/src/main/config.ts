@@ -8,7 +8,9 @@
  */
 import Store from 'electron-store';
 import type { AppConfig, MigrationEntry } from './config-migration';
-import { CONFIG_DEFAULTS, resolveAudioSection, runLegacyYamlMigration } from './config-migration';
+import {
+  CONFIG_DEFAULTS, resolveAsrSection, resolveAudioSection, runLegacyYamlMigration
+} from './config-migration';
 import type { BackendLogger } from './backend-manager';
 
 export type { AppConfig } from './config-migration';
@@ -32,6 +34,8 @@ export class ConfigStore {
     this.normalizeWindowSection();
     this.normalizeAudioSection();
     this.normalizeTranslationSection();
+    this.normalizeAsrSection();
+    this.pruneLegacyShortcutKeys();
   }
 
   /**
@@ -73,6 +77,46 @@ export class ConfigStore {
     const t = this.store.get('translation') as Partial<AppConfig['translation']> | undefined;
     if (t && t.model === undefined) {
       this.store.set('translation', { ...CONFIG_DEFAULTS.translation, ...t });
+    }
+  }
+
+  /**
+   * asr 段规范化（幂等；settings-management spec「Whisper 档位偏好迁移」）：
+   * 旧 store 的 Whisper 模型档位字段（`asr.model`，如 'base'）随引擎替换
+   * 一并移除，改写为 `{ language }`（非法/缺失语言回退默认 ja，日志记录迁移）。
+   */
+  private normalizeAsrSection(): void {
+    const raw = this.store.get('asr') as unknown;
+    const resolved = resolveAsrSection(raw);
+    if (resolved.changed) {
+      const hadModel = (raw !== null && typeof raw === 'object'
+        && 'model' in (raw as Record<string, unknown>));
+      (this.store.set as unknown as (key: string, value: unknown) => void)(
+        'asr', { language: resolved.language }
+      );
+      if (hadModel) {
+        // 迁移日志（spec 场景：升级首启移除档位字段并初始化源语言）
+        console.info('[config] asr.model（Whisper 档位）已移除，源语言偏好初始化为', resolved.language);
+      }
+    }
+  }
+
+  /**
+   * 快捷键段清理（幂等）：移除随模型档位废弃的 `switchModel` 键（Ctrl+Shift+M）
+   * ——specs: overlay-window「快捷键完整注册」。残留键不再注册、不展示。
+   */
+  private pruneLegacyShortcutKeys(): void {
+    const shortcuts = this.store.get('shortcuts') as unknown;
+    const status = this.store.get('shortcutStatus') as unknown;
+    const sRec = (shortcuts !== null && typeof shortcuts === 'object' ? shortcuts : null) as Record<string, unknown> | null;
+    const stRec = (status !== null && typeof status === 'object' ? status : null) as Record<string, unknown> | null;
+    if (sRec && 'switchModel' in sRec) {
+      const { switchModel: _removed, ...rest } = sRec;
+      this.store.set('shortcuts', rest as unknown as AppConfig['shortcuts']);
+    }
+    if (stRec && 'switchModel' in stRec) {
+      const { switchModel: _removed, ...rest } = stRec;
+      this.store.set('shortcutStatus', rest as unknown as AppConfig['shortcutStatus']);
     }
   }
 

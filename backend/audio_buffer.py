@@ -2,11 +2,13 @@
 音频缓冲与 VAD 语句切分模块
 
 RingBuffer：定长环形缓冲，线程安全（录音线程写入，事件循环线程读取）。
-UtteranceSegmenter：基于 faster-whisper 内置 Silero VAD 的语句切分，
+UtteranceSegmenter：基于项目内嵌 Silero VAD（vendor/silero_vad，自 faster-whisper
+MIT 实现内嵌，经 ONNX Runtime 加载；MUST NOT 依赖 faster-whisper 包）的语句切分，
 仅在事件循环线程周期性调用 tick()，非线程安全。
 """
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -26,10 +28,19 @@ class UtteranceSegment:
     ts_start/ts_end 以样本位置换算（sample_pos / sample_rate），相对进程
     捕获时钟单调递增，供客户端导出精确 SRT 时间轴；兼容路径（裸数组注入）
     下可为 None，客户端以接收时刻近似。
+
+    延迟埋点字段（兼容路径下均为 None）：
+    - cut_at: 切出时刻（time.monotonic 秒），端到端耗时起点；
+    - silence_wait_s: 切句时尾部静音时长（未加 speech_pad 起算，音频域），
+      仅触发切分的末段有值；
+    - enqueued_at: 入队时刻（time.monotonic 秒），由 PipelineWorker 填充。
     """
     audio: np.ndarray
     ts_start: Optional[float] = None
     ts_end: Optional[float] = None
+    cut_at: Optional[float] = None
+    silence_wait_s: Optional[float] = None
+    enqueued_at: Optional[float] = None
 
 
 class RingBuffer:
@@ -108,7 +119,7 @@ class UtteranceSegmenter:
         self,
         sample_rate: int = 16000,
         threshold: float = 0.5,
-        min_silence_ms: int = 600,
+        min_silence_ms: int = 400,
         speech_pad_ms: int = 200,
         max_utterance_s: float = 15.0,
         head_pad_ms: int = 300,
@@ -121,6 +132,8 @@ class UtteranceSegmenter:
         self.min_silence_samples = int(sample_rate * min_silence_ms / 1000)
         self.max_utterance_samples = int(sample_rate * max_utterance_s)
         self.head_pad_samples = int(sample_rate * head_pad_ms / 1000)
+        # VAD 端点外扩样本数：完成性判定需剔除（见 tick）
+        self.speech_pad_samples = int(sample_rate * speech_pad_ms / 1000)
         self._min_emit_samples = int(sample_rate * 0.1)  # 短于 100ms 不产出
         self._vad_fn = vad_fn  # None → 首次 tick 时加载 faster-whisper 内置 VAD
         self._consumed = 0  # 已消费的绝对样本位置
@@ -139,8 +152,8 @@ class UtteranceSegmenter:
         return self._speech_active
 
     def _default_vad(self, audio: np.ndarray) -> List[dict]:
-        """faster-whisper 内置 Silero VAD（模型为进程内单例）"""
-        from faster_whisper.vad import VadOptions, get_speech_timestamps
+        """项目内嵌 Silero VAD（模型为进程内单例；经 ONNX Runtime 加载）"""
+        from vendor.silero_vad.vad import VadOptions, get_speech_timestamps
 
         options = VadOptions(
             threshold=self.threshold,
@@ -191,9 +204,14 @@ class UtteranceSegmenter:
             seg_start = base + seg['start']
             seg_end = base + seg['end']
             is_last = i == len(segments) - 1
+            silence_wait_s: Optional[float] = None
 
             if is_last:
+                # 完成性判定以未加 speech_pad 的语音末端起算（VAD 端点含外扩）；
+                # 窗口末端截断（原始间隙为 0）时不加回 pad，保持保守判定
                 trailing_silence = end - seg_end
+                if trailing_silence > 0:
+                    trailing_silence += self.speech_pad_samples
                 complete = trailing_silence >= self.min_silence_samples
                 too_long = (seg_end - seg_start) >= self.max_utterance_samples
                 if not complete and not too_long:
@@ -201,6 +219,7 @@ class UtteranceSegmenter:
                 if too_long and not complete:
                     # 超长强制切分，剩余部分下轮重新检测
                     seg_end = seg_start + self.max_utterance_samples
+                silence_wait_s = trailing_silence / self.sample_rate
 
             audio_start = max(seg_start - self.head_pad_samples, 0)
             audio = buffer.read_range(audio_start, seg_end)
@@ -209,6 +228,8 @@ class UtteranceSegmenter:
                     audio=audio,
                     ts_start=audio_start / self.sample_rate,
                     ts_end=seg_end / self.sample_rate,
+                    cut_at=time.monotonic(),
+                    silence_wait_s=silence_wait_s,
                 ))
             self._consumed = max(self._consumed, seg_end)
 

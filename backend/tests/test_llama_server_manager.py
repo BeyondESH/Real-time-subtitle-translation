@@ -5,10 +5,22 @@
 import asyncio
 import subprocess
 import time
+import types
 from pathlib import Path
+
+import pytest
 
 import llama_server_manager as lsm
 from llama_server_manager import LlamaServerManager, ServerConfig
+
+# 真实回收函数引用（autouse 夹具会以 no-op 替换模块属性防止用例误触 PowerShell）
+_real_kill_stale = lsm.kill_stale_llama_servers
+
+
+@pytest.fixture(autouse=True)
+def _no_real_stale_reap(monkeypatch):
+    """默认屏蔽启动回收（避免单测触发真实 PowerShell）；专项用例自行覆写。"""
+    monkeypatch.setattr(lsm, 'kill_stale_llama_servers', lambda: 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -266,3 +278,57 @@ def test_list_devices_none_and_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr(lsm.subprocess, 'run', boom)
     assert lsm.list_devices(tmp_path / 'x.exe') == []
+
+
+# --------------------------------------------------------------------------- #
+# 启动期遗留进程回收（kill_stale_llama_servers）
+# --------------------------------------------------------------------------- #
+
+class TestStaleServerReap:
+    def test_filters_by_vendor_path_and_parses_pids(self, monkeypatch):
+        """按 vendor 路径过滤并解析被清理 PID；幂等（每进程仅执行一次）"""
+        monkeypatch.setattr(lsm, '_stale_reaped', False)
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return types.SimpleNamespace(stdout='1234\n5678\n', returncode=0)
+
+        monkeypatch.setattr(lsm.subprocess, 'run', fake_run)
+        assert _real_kill_stale() == 2
+        cmd = ' '.join(calls[0][0])
+        assert 'llama-server.exe' in cmd
+        assert 'Stop-Process' in cmd
+        assert 'ExecutablePath' in cmd
+        # 幂等：第二次调用不重复执行
+        assert _real_kill_stale() == 0
+        assert len(calls) == 1
+
+    def test_non_windows_noop(self, monkeypatch):
+        monkeypatch.setattr(lsm, '_stale_reaped', False)
+        monkeypatch.setattr(lsm, 'os', types.SimpleNamespace(name='posix'))
+        calls = []
+        monkeypatch.setattr(lsm.subprocess, 'run', lambda *a, **k: calls.append(a))
+        assert _real_kill_stale() == 0
+        assert calls == []
+
+    def test_failure_is_swallowed(self, monkeypatch):
+        """回收失败（PowerShell 缺失/超时/异常）静默返回 0，MUST NOT 抛出"""
+        monkeypatch.setattr(lsm, '_stale_reaped', False)
+
+        def boom(*a, **k):
+            raise OSError('powershell missing')
+
+        monkeypatch.setattr(lsm.subprocess, 'run', boom)
+        assert _real_kill_stale() == 0
+
+    async def test_manager_start_invokes_reap(self, tmp_path, monkeypatch):
+        """manager.start 触发一次回收调用（每个启动动作一次；函数自身幂等）"""
+        calls = []
+        monkeypatch.setattr(lsm, 'kill_stale_llama_servers', lambda: calls.append(1))
+
+        spawner = FakeSpawner([FakeProc()])
+        mgr = _manager(tmp_path, spawner, HEALTH_OK())
+        await mgr.start(_config(tmp_path))
+        await mgr.stop()
+        assert len(calls) == 1

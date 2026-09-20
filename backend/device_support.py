@@ -1,8 +1,11 @@
 """
 推理设备探测与静默降级决策。
 
-设计要点（design.md D5 / 原 design.md D7）：
-- ASR 经 faster-whisper → CTranslate2 执行，必须以 CTranslate2 的 CUDA 设备数探测；
+设计要点（replace-asr-engine-with-funasr-nano design.md D5）：
+- ASR 经 sherpa-onnx（内嵌 onnxruntime）执行，以 onnxruntime 暴露的 CUDA
+  provider 可用性探测（注：sherpa-onnx wheel 自带 ORT，与独立 onnxruntime 包
+  可能不同构建；探针为尽力判定，实际以加载路径的端到端热身为准，
+  失败按 load_failed/runtime_failed 静默降级）；
 - 翻译经 llama.cpp（随包 llama-server 子进程）执行，必须以该构建的
   `--list-devices` 设备枚举探测（cuda 构建能枚举到 CUDA 设备才算可用）；
 - 两引擎独立判定，任一探针导入/调用异常一律降为不可用，异常 MUST NOT 逃逸；
@@ -19,30 +22,68 @@ VALID_DEVICES = ('auto', 'cpu', 'cuda')
 # 设备选择/降级原因枚举（design.md D8；runtime_failed=加载成功后运行期推理不可用）
 DEVICE_REASONS = ('auto', 'user', 'no_cuda', 'load_failed', 'runtime_failed')
 
-# 偏好为 cpu 或探针不可用时的 CPU 计算类型
-CPU_COMPUTE_TYPE = 'int8'
-
 
 def normalize_device(value) -> str:
     """将任意配置值归一为合法偏好，非法值按 'auto' 处理。"""
     return value if value in VALID_DEVICES else 'auto'
 
 
-def _probe_ctranslate2() -> dict:
-    """ASR 探针：CTranslate2 可见的 CUDA 设备数（异常降为不可用）。"""
+def _sherpa_version_tag() -> str:
+    """sherpa-onnx 版本标识（模块级便于测试注入；导入失败返回空串）"""
     try:
-        import ctranslate2
-        count = ctranslate2.get_cuda_device_count()
+        import sherpa_onnx
+
+        return getattr(sherpa_onnx, '__version__', '') or ''
+    except Exception:  # noqa: BLE001 - 探针异常降为回落路径
+        return ''
+
+
+def _probe_sherpa_cuda_variant() -> Optional[dict]:
+    """
+    sherpa-onnx wheel 自身的 CUDA 能力探测（CUDA 变体 wheel 自带 CUDA 版
+    onnxruntime 与 cuDNN9 DLL，与独立 `onnxruntime` 包是两套构建）。
+
+    CUDA 变体的版本本地版本含 `+cuda` 标识（如 `1.13.8+cuda12.cudnn9`）——
+    这是 ASR 实际运行时暴露的最直接能力信号；CPU 变体返回 None（回落独立
+    onnxruntime 探针）。
+    """
+    version = _sherpa_version_tag()
+    if '+cuda' in version:
         return {
-            'cuda_available': bool(count and count > 0),
-            'source': 'ctranslate2',
-            'detail': f'get_cuda_device_count()={count}',
+            'cuda_available': True,
+            'source': 'sherpa_onnx',
+            'detail': f'sherpa-onnx {version}（CUDA 变体，自带 CUDA 版 onnxruntime）',
+        }
+    return None
+
+
+def _probe_onnxruntime() -> dict:
+    """
+    ASR 探针：优先以 sherpa-onnx wheel 的 CUDA 能力为准（ASR 实际经其内嵌 ORT
+    推理）；sherpa-onnx 为 CPU 变体时回落独立 onnxruntime 包的 provider 列表。
+
+    注意：独立 `onnxruntime` 包与 sherpa-onnx 自带的 ORT 可能是不同构建——探针
+    为尽力判定，实际以加载路径的端到端热身为准（失败按 load_failed/runtime_failed
+    静默降级）。
+    """
+    sherpa_probe = _probe_sherpa_cuda_variant()
+    if sherpa_probe is not None:
+        return sherpa_probe
+    try:
+        import onnxruntime
+
+        providers = onnxruntime.get_available_providers()
+        available = 'CUDAExecutionProvider' in providers
+        return {
+            'cuda_available': available,
+            'source': 'onnxruntime',
+            'detail': f'providers={providers}',
         }
     except Exception as e:  # noqa: BLE001 - 探针异常一律降为不可用，不让异常逃逸
         return {
             'cuda_available': False,
             'source': 'none',
-            'detail': f'ctranslate2 探针不可用: {e}',
+            'detail': f'onnxruntime 探针不可用: {e}',
         }
 
 
@@ -80,7 +121,7 @@ def probe_compute() -> dict:
          'translation': {cuda_available, source, detail}}
     """
     return {
-        'asr': _probe_ctranslate2(),
+        'asr': _probe_onnxruntime(),
         'translation': _probe_llama(),
     }
 

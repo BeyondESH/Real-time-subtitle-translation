@@ -1,5 +1,5 @@
 """
-设备探测与静默降级决策纯函数测试（monkeypatch ct2/llama 全组合）
+设备探测与静默降级决策纯函数测试（monkeypatch onnxruntime/llama 全组合）
 
 不加载真实模型、不访问网络。
 """
@@ -17,15 +17,19 @@ from device_support import (
 )
 
 
-def fake_ct2(count=None, raises=None):
+def fake_ort(providers=None, raises=None):
+    """onnxruntime 替身：get_available_providers 返回指定 provider 列表"""
     module = types.SimpleNamespace()
     if raises is not None:
         def _boom():
             raise raises
-        module.get_cuda_device_count = _boom
+        module.get_available_providers = _boom
     else:
-        module.get_cuda_device_count = lambda: count
+        module.get_available_providers = lambda: list(providers or [])
     return module
+
+
+_CUDA_PROVIDERS = ['CUDAExecutionProvider', 'CPUExecutionProvider']
 
 
 @pytest.fixture
@@ -55,51 +59,89 @@ def llama_probe(monkeypatch, tmp_path):
 
 
 class TestProbeCompute:
+    @pytest.fixture(autouse=True)
+    def _no_host_sherpa_cuda(self, monkeypatch):
+        """默认固定 sherpa 版本为 CPU 变体：真实环境装了 CUDA 变体 wheel 时
+        不污染「onnxruntime 路径」用例的判定（CUDA 变体用例自行覆写）。"""
+        monkeypatch.setattr('device_support._sherpa_version_tag', lambda: '1.13.8')
+
+    def test_sherpa_cuda_variant_takes_priority(self, monkeypatch, llama_probe):
+        """sherpa-onnx 为 CUDA 变体（+cuda 版本标识）→ 直接判可用（自带 CUDA 版 ORT）"""
+        monkeypatch.setitem(sys.modules, 'onnxruntime', fake_ort(['CPUExecutionProvider']))
+        monkeypatch.setattr(
+            'device_support._sherpa_version_tag', lambda: '1.13.8+cuda12.cudnn9'
+        )
+        llama_probe(devices=[])
+        result = probe_compute()
+        assert result['asr']['cuda_available'] is True
+        assert result['asr']['source'] == 'sherpa_onnx'
+        assert result['translation']['cuda_available'] is False
+
+    def test_sherpa_cpu_variant_falls_back_to_ort(self, monkeypatch, llama_probe):
+        """sherpa-onnx 为 CPU 变体 → 回落独立 onnxruntime 探针"""
+        monkeypatch.setitem(sys.modules, 'onnxruntime', fake_ort(_CUDA_PROVIDERS))
+        monkeypatch.setattr('device_support._sherpa_version_tag', lambda: '1.13.8')
+        llama_probe(devices=[])
+        result = probe_compute()
+        assert result['asr']['cuda_available'] is True
+        assert result['asr']['source'] == 'onnxruntime'
+
     def test_both_available(self, monkeypatch, llama_probe):
-        monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(1))
+        monkeypatch.setitem(sys.modules, 'onnxruntime', fake_ort(_CUDA_PROVIDERS))
         llama_probe(devices=['CUDA0: NVIDIA GeForce RTX 5060 (8123 MiB, 7031 MiB free)'])
         result = probe_compute()
         assert result['asr']['cuda_available'] is True
-        assert result['asr']['source'] == 'ctranslate2'
+        assert result['asr']['source'] == 'onnxruntime'
+        assert result['translation']['cuda_available'] is True
+        assert result['translation']['source'] == 'llama_cpp'
+
+    def test_both_available(self, monkeypatch, llama_probe):
+        monkeypatch.setitem(sys.modules, 'onnxruntime', fake_ort(_CUDA_PROVIDERS))
+        llama_probe(devices=['CUDA0: NVIDIA GeForce RTX 5060 (8123 MiB, 7031 MiB free)'])
+        result = probe_compute()
+        assert result['asr']['cuda_available'] is True
+        assert result['asr']['source'] == 'onnxruntime'
         assert result['translation']['cuda_available'] is True
         assert result['translation']['source'] == 'llama_cpp'
 
     def test_asr_only(self, monkeypatch, llama_probe):
-        """CTranslate2 可用而 llama.cpp 枚举不到 CUDA 设备（或仅为 CPU 构建）"""
-        monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(1))
+        """onnxruntime 有 CUDA provider 而 llama.cpp 枚举不到 CUDA 设备"""
+        monkeypatch.setitem(sys.modules, 'onnxruntime', fake_ort(_CUDA_PROVIDERS))
         llama_probe(devices=[])
         result = probe_compute()
         assert result['asr']['cuda_available'] is True
         assert result['translation']['cuda_available'] is False
 
     def test_translation_only(self, monkeypatch, llama_probe):
-        monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(0))
+        monkeypatch.setitem(sys.modules, 'onnxruntime', fake_ort(['CPUExecutionProvider']))
         llama_probe(devices=['CUDA0: NVIDIA GeForce RTX 5060 (8123 MiB, 7031 MiB free)'])
         result = probe_compute()
         assert result['asr']['cuda_available'] is False
         assert result['translation']['cuda_available'] is True
 
     def test_both_unavailable(self, monkeypatch, llama_probe):
-        monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(0))
+        monkeypatch.setitem(sys.modules, 'onnxruntime', fake_ort(['CPUExecutionProvider']))
         llama_probe(devices=['(none)'])
         result = probe_compute()
         assert result['asr']['cuda_available'] is False
         assert result['translation']['cuda_available'] is False
 
     def test_probe_exceptions_do_not_escape(self, monkeypatch, llama_probe):
-        monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(raises=RuntimeError('ct2 炸了')))
+        monkeypatch.setitem(
+            sys.modules, 'onnxruntime', fake_ort(raises=RuntimeError('ort 炸了'))
+        )
         llama_probe(raises=RuntimeError('llama 炸了'))
         result = probe_compute()  # MUST NOT raise
         assert result['asr']['cuda_available'] is False
         assert result['asr']['source'] == 'none'
-        assert 'ct2 炸了' in result['asr']['detail']
+        assert 'ort 炸了' in result['asr']['detail']
         assert result['translation']['cuda_available'] is False
         assert result['translation']['source'] == 'none'
         assert 'llama 炸了' in result['translation']['detail']
 
     def test_probe_import_error_do_not_escape(self, monkeypatch, llama_probe):
         # None in sys.modules → import 抛 ImportError，应被吞掉
-        monkeypatch.setitem(sys.modules, 'ctranslate2', None)
+        monkeypatch.setitem(sys.modules, 'onnxruntime', None)
         llama_probe(missing=True)
         result = probe_compute()
         assert result['asr']['cuda_available'] is False
@@ -115,7 +157,9 @@ class TestProbeCompute:
 
     def test_probes_independent(self, monkeypatch, llama_probe):
         """一个探针异常不影响另一个的判定"""
-        monkeypatch.setitem(sys.modules, 'ctranslate2', fake_ct2(raises=RuntimeError('x')))
+        monkeypatch.setitem(
+            sys.modules, 'onnxruntime', fake_ort(raises=RuntimeError('x'))
+        )
         llama_probe(devices=['CUDA0: NVIDIA GeForce RTX 5060 (8123 MiB, 7031 MiB free)'])
         result = probe_compute()
         assert result['asr']['cuda_available'] is False

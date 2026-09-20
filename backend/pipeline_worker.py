@@ -9,9 +9,10 @@
 恢复 MUST NOT 要求重启后端。单条语句受时间预算约束，超时丢弃并继续（活性兜底）。
 """
 import asyncio
+import inspect
 import logging
 import time
-from typing import Callable, Optional, Union
+from typing import Awaitable, Callable, Optional, Union
 
 import numpy as np
 
@@ -38,6 +39,24 @@ def segment_budget_s(segment: UtteranceSegment) -> float:
     return max(30.0, 4.0 * duration + 20.0)
 
 
+def _supports_partial_callback(translator: object) -> bool:
+    """
+    判断翻译器是否显式声明 on_partial 形参（流式回调能力自描述）。
+
+    真机 Translator.translate_with_metrics 声明了该形参；不支持流式回调的旧
+    实现/测试双打器（如裸 AsyncMock，签名为 (*args, **kwargs)）跳过传参，
+    保持其既有调用契约不变。
+    """
+    method = getattr(translator, 'translate_with_metrics', None)
+    if method is None:
+        return False
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    return 'on_partial' in params
+
+
 class PipelineWorker:
     """语句消费协程：ASR → 翻译（仅激活语言）→ 广播"""
 
@@ -57,6 +76,8 @@ class PipelineWorker:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._dropped_count = 0
+        # 进程内单调语句标识计数（partial/final/cancel 贯穿；不复用）
+        self._id_seq = 0
 
         # 停滞监管状态
         self._stall_timeout_s = float(stall_timeout_s)
@@ -92,6 +113,13 @@ class PipelineWorker:
 
         if isinstance(segment, np.ndarray):
             segment = UtteranceSegment(audio=segment)
+
+        # 进程内单调语句标识：随 partial/final/cancel 贯穿（兼容路径同样分配）
+        self._id_seq += 1
+        segment.id = f"u{self._id_seq}"
+
+        # 入队时刻（延迟埋点：queue_ms 的起点；兼容路径同样记录）
+        segment.enqueued_at = time.monotonic()
 
         try:
             self._queue.put_nowait(segment)
@@ -255,8 +283,14 @@ class PipelineWorker:
         })
 
     async def _process(self, segment: UtteranceSegment):
-        """处理单条语句段：ASR → 翻译 → 广播（含时间戳透传）"""
-        # ASR 未就绪（如模型切换中）时丢弃
+        """
+        处理单条语句段：ASR → 流式翻译（增量广播 partial）→ 定稿广播。
+
+        partial 生命周期：已广播进行中帧而未成功定稿的退出路径（超时取消/异常）
+        由 finally 以 fire-and-forget 方式补发 subtitle_cancel 清算；未推过
+        partial 的路径（引擎未就绪/空识别结果）MUST NOT 产生清算帧。
+        """
+        # ASR 未就绪（如模型切换中）时丢弃（未推 partial，无需清算）
         if not getattr(self._asr, 'is_ready', True):
             self._dropped_count += 1
             logger.debug("ASR 未就绪，语句被丢弃")
@@ -265,32 +299,128 @@ class PipelineWorker:
         # 翻译引擎未就绪（模型切换/预载/重启中）时丢弃（与 ASR 对称）
         if not getattr(self._translator, 'is_ready', True):
             self._dropped_count += 1
-            logger.debug("翻译引擎未就绪，语句被丢弃")
+            logger.debug("翻译引擎未就绪，语句被跳过")
             return
 
-        transcription = await self._asr.transcribe(segment.audio)
-        if not transcription or not transcription.get('text'):
-            return
+        segment_id: Optional[str] = getattr(segment, 'id', None)
+        partial_sent = False
+        first_partial_at: Optional[float] = None
+        cancel_reason = 'dropped'
+        finished = False
+        try:
+            started = time.monotonic()
+            queue_ms = (
+                (started - segment.enqueued_at) * 1000.0
+                if segment.enqueued_at is not None else None
+            )
 
-        # 只翻译激活目标语言（多语言全翻会放大推理延迟）
-        active = self._get_active_language() if self._get_active_language else None
-        targets = [active] if active else None
-        translations = await self._translator.translate(
-            transcription['text'],
-            transcription['language'],
-            targets
-        )
+            asr_started = time.monotonic()
+            transcription = await self._asr.transcribe(segment.audio)
+            asr_ms = (time.monotonic() - asr_started) * 1000.0
+            if not transcription or not transcription.get('text'):
+                return
 
-        payload = {
-            'type': 'subtitle',
-            'original': transcription['text'],
-            'source_language': transcription['language'],
-            'active_language': active,
-            'translations': translations
+            # 只翻译激活目标语言（多语言全翻会放大推理延迟）
+            active = self._get_active_language() if self._get_active_language else None
+            targets = [active] if active else None
+
+            async def on_partial(
+                target_lang: str, accumulated: str, is_first: bool
+            ) -> None:
+                """广播进行中帧：同一句共享 id，translations 为该语言累积译文"""
+                nonlocal partial_sent, first_partial_at
+                await self._ws.send({
+                    'type': 'subtitle_partial',
+                    'id': segment_id,
+                    'original': transcription['text'],
+                    'source_language': transcription['language'],
+                    'active_language': active,
+                    'translations': {target_lang: accumulated},
+                })
+                partial_sent = True
+                # 首帧时刻以广播完成为准（first_token_ms 起点为切句时刻）
+                if is_first and first_partial_at is None:
+                    first_partial_at = time.monotonic()
+
+            llm_started = time.monotonic()
+            translate_kwargs: dict = {}
+            if _supports_partial_callback(self._translator):
+                translate_kwargs['on_partial'] = on_partial
+            translations, tps_by_lang = await self._translator.translate_with_metrics(
+                transcription['text'],
+                transcription['language'],
+                targets,
+                **translate_kwargs,
+            )
+            llm_ms = (time.monotonic() - llm_started) * 1000.0
+
+            payload = {
+                'type': 'subtitle',
+                'id': segment_id,
+                'original': transcription['text'],
+                'source_language': transcription['language'],
+                'active_language': active,
+                'translations': translations
+            }
+            # 首字时延（切句 → 首个进行中帧）：仅流式且实际产生首帧时携带
+            if first_partial_at is not None and segment.cut_at is not None:
+                payload['first_token_ms'] = int(round(max(
+                    0.0, (first_partial_at - segment.cut_at) * 1000.0
+                )))
+            # LLM 生成速度透传：仅激活语言实际生成成功时携带；缺失不附加字段
+            if active and active in tps_by_lang:
+                payload['tps'] = tps_by_lang[active]
+            # 时间戳透传（SRT 精确导出的前提）；兼容路径缺失时不附加字段
+            if segment.ts_start is not None and segment.ts_end is not None:
+                payload['ts_start'] = round(segment.ts_start, 3)
+                payload['ts_end'] = round(segment.ts_end, 3)
+            # 分阶段耗时透传（全有或全无）：兼容路径（无切句/入队时刻）不携带
+            latency = self._build_latency(segment, queue_ms, asr_ms, llm_ms)
+            if latency is not None:
+                payload['latency'] = latency
+                logger.info(
+                    "端到端 %.2fs（静音等待 %.2fs / 队列 %.2fs / 识别 %.2fs / 翻译 %.2fs）",
+                    (latency['endpoint_ms'] + latency['total_ms']) / 1000.0,
+                    latency['endpoint_ms'] / 1000.0,
+                    latency['queue_ms'] / 1000.0,
+                    latency['asr_ms'] / 1000.0,
+                    latency['llm_ms'] / 1000.0,
+                )
+
+            await self._ws.send(payload)
+            finished = True
+        except asyncio.CancelledError:
+            # segment_budget_s 超时取消（wait_for 取消）：清算原因 timeout
+            cancel_reason = 'timeout'
+            raise
+        except Exception:
+            # 请求/处理异常：_run 保留既有日志与超时处理，这里仅记录清算原因
+            cancel_reason = 'failed'
+            raise
+        finally:
+            # 每个已广播的进行中帧必有终结；取消清理路径不得 await
+            if partial_sent and not finished:
+                asyncio.create_task(self._ws.send({
+                    'type': 'subtitle_cancel',
+                    'id': segment_id,
+                    'reason': cancel_reason,
+                }))
+
+    def _build_latency(
+        self, segment: UtteranceSegment,
+        queue_ms: Optional[float], asr_ms: float, llm_ms: float,
+    ) -> Optional[dict]:
+        """组装分阶段耗时（5 键齐全、非负整数 ms）；任一来源缺失返回 None（全有或全无）"""
+        if (
+            segment.cut_at is None
+            or segment.silence_wait_s is None
+            or queue_ms is None
+        ):
+            return None
+        return {
+            'endpoint_ms': int(round(max(0.0, segment.silence_wait_s * 1000.0))),
+            'queue_ms': int(round(max(0.0, queue_ms))),
+            'asr_ms': int(round(max(0.0, asr_ms))),
+            'llm_ms': int(round(max(0.0, llm_ms))),
+            'total_ms': int(round(max(0.0, (time.monotonic() - segment.cut_at) * 1000.0))),
         }
-        # 时间戳透传（SRT 精确导出的前提）；兼容路径缺失时不附加字段
-        if segment.ts_start is not None and segment.ts_end is not None:
-            payload['ts_start'] = round(segment.ts_start, 3)
-            payload['ts_end'] = round(segment.ts_end, 3)
-
-        await self._ws.send(payload)

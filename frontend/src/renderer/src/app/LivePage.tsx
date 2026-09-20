@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowDown, Pause, Play, Lock, Unlock, Captions } from 'lucide-react';
 import { Button, EmptyState, Pill, ProgressBar, StatusDot, cx } from '../components/ui';
-import { useAppConfig, useAppState, useSubtitleStream, type CaptionEntry } from '../state/hooks';
+import { useAppConfig, useAppState, useSubtitleStream, useTypewriterText, type CaptionEntry } from '../state/hooks';
 import { langPairLabel } from './lang-labels';
 import { StatusPillBar } from './StatusPillBar';
 import { ToastHost } from './ToastHost';
@@ -12,30 +12,81 @@ function formatTime(ms: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function CaptionCard({
+/** latency 全字段有效性守卫（全有或全无契约；缺字段/非有限数一律不显示） */
+function isLatencyValid(
+  v: SubtitleMessageView['latency']
+): v is NonNullable<SubtitleMessageView['latency']> {
+  return v !== undefined
+    && Number.isFinite(v.endpoint_ms)
+    && Number.isFinite(v.queue_ms)
+    && Number.isFinite(v.asr_ms)
+    && Number.isFinite(v.llm_ms)
+    && Number.isFinite(v.total_ms);
+}
+
+export function CaptionCard({
   entry, displayMode
 }: {
   entry: CaptionEntry;
   displayMode: string;
 }) {
   const m = entry.msg;
+  const streaming = entry.streaming === true;
+  const final = m.type === 'subtitle' ? m : null;
   const active = m.active_language;
   const translation = (active && m.translations && m.translations[active]) || m.original;
+  const revealed = useTypewriterText(translation);
   const showOriginal = displayMode === 'original_and_translation'
     && Boolean(m.original)
     && m.source_language !== active;
+  const latency = final !== null && isLatencyValid(final.latency) ? final.latency : null;
+  const firstTokenMs = final !== null
+    && typeof final.first_token_ms === 'number'
+    && Number.isFinite(final.first_token_ms)
+    ? final.first_token_ms
+    : null;
+
+  // 脚注分解悬浮提示：定稿才有分解项；首字时延缺失/非法则不占位
+  const titleParts: string[] = [];
+  if (latency !== null) {
+    titleParts.push(
+      `静音等待 ${(latency.endpoint_ms / 1000).toFixed(2)}s`,
+      `队列 ${(latency.queue_ms / 1000).toFixed(2)}s`,
+      `识别 ${(latency.asr_ms / 1000).toFixed(2)}s`,
+      `翻译 ${(latency.llm_ms / 1000).toFixed(2)}s`
+    );
+  }
+  if (firstTokenMs !== null) {
+    titleParts.push(`首字 ${(firstTokenMs / 1000).toFixed(2)}s`);
+  }
+  const footnoteTitle = titleParts.length > 0 ? titleParts.join(' · ') : undefined;
 
   return (
     <div className="caption-enter mb-5 flex flex-col items-center gap-1 text-center">
-      <p className="max-w-3xl text-xl leading-relaxed text-primary">{translation}</p>
-      {showOriginal && (
-        <p className="max-w-3xl text-sm leading-relaxed text-secondary">{m.original}</p>
-      )}
-      <p className="text-xs text-secondary opacity-60">
-        {formatTime(entry.receivedAt)}
-        {' · '}
-        {langPairLabel(m.source_language, active)}
+      {/* 进行中态弱化呈现（次级语气 + 降低不透明度）；定稿保持既有样式 */}
+      <p
+        className={cx(
+          'max-w-3xl text-xl leading-relaxed transition duration-normal ease-app',
+          streaming ? 'text-secondary opacity-70' : 'text-primary'
+        )}
+      >
+        {revealed}
       </p>
+      {showOriginal && (
+        <p className={cx('max-w-3xl text-sm leading-relaxed text-secondary', streaming && 'opacity-60')}>
+          {m.original}
+        </p>
+      )}
+      {/* 脚注仅定稿显示（进行中帧无时间戳/语言对/tps/耗时） */}
+      {!streaming && (
+        <p className="text-xs text-secondary opacity-60" title={footnoteTitle}>
+          {formatTime(entry.receivedAt)}
+          {' · '}
+          {langPairLabel(m.source_language, active)}
+          {typeof final?.tps === 'number' ? ` · ${final.tps.toFixed(1)} tok/s` : null}
+          {latency !== null ? ` · ${((latency.endpoint_ms + latency.total_ms) / 1000).toFixed(1)}s` : null}
+        </p>
+      )}
     </div>
   );
 }

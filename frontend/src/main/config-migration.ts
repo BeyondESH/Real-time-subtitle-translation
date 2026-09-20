@@ -9,10 +9,11 @@
 import * as fs from 'fs';
 import { load as loadYaml } from 'js-yaml';
 import {
-  DEFAULT_AUDIO_SOURCE, type AudioSourcePref, type AudioSourceTarget
+  DEFAULT_AUDIO_SOURCE, DEFAULT_SOURCE_LANGUAGE, type AudioSourcePref,
+  type AudioSourceTarget, type SourceLanguage
 } from '../shared/ipc-types';
 
-export type { AudioSourcePref, AudioSourceTarget } from '../shared/ipc-types';
+export type { AudioSourcePref, AudioSourceTarget, SourceLanguage } from '../shared/ipc-types';
 
 // ---------- 规范 schema（向后兼容旧 store 键路径） ----------
 
@@ -42,7 +43,6 @@ export interface SubtitleConfig {
 export interface ShortcutSet {
   togglePause: string;
   switchLanguage: string;
-  switchModel: string;
   toggleLock: string;
 }
 
@@ -60,7 +60,8 @@ export interface AppConfig {
   /** 全局快捷键注册结果（false=被占用，设置页警示） */
   shortcutStatus: Record<keyof ShortcutSet, boolean>;
   translation: { targetLanguages: string[]; activeLanguage: string; model: string };
-  asr: { model: string };
+  /** 源语言偏好（识别提示 + 翻译源语言；Whisper 档位字段随引擎替换移除） */
+  asr: { language: SourceLanguage };
   /** 推理设备偏好；auto=后端自动探测（显式 cpu/cuda 经 SUBTITLE_DEVICE 注入） */
   inference: { device: InferenceDevice };
   /** 音频源偏好（结构化：设备源或按进程源） */
@@ -98,18 +99,17 @@ export const CONFIG_DEFAULTS: AppConfig = {
   shortcuts: {
     togglePause: 'Ctrl+Shift+Space',
     switchLanguage: 'Ctrl+Shift+L',
-    switchModel: 'Ctrl+Shift+M',
     toggleLock: 'Ctrl+Shift+D'
   },
   shortcutStatus: {
-    togglePause: true, switchLanguage: true, switchModel: true, toggleLock: true
+    togglePause: true, switchLanguage: true, toggleLock: true
   },
   translation: {
     targetLanguages: ['zh', 'en'],
     activeLanguage: 'zh',
     model: DEFAULT_TRANSLATION_MODEL
   },
-  asr: { model: 'base' },
+  asr: { language: DEFAULT_SOURCE_LANGUAGE },
   inference: { device: 'auto' },
   audio: { source: { ...DEFAULT_AUDIO_SOURCE } },
   locked: true,
@@ -124,23 +124,19 @@ export const CONFIG_DEFAULTS: AppConfig = {
   legacyMigrated: false
 };
 
-// ---------- 音频源（结构化，settings-management spec D10） ----------
+// ---------- 音频源（结构化设备源，settings-management spec） ----------
 
 function isAudioSourcePref(v: unknown): v is AudioSourcePref {
   if (v === null || typeof v !== 'object') return false;
   const rec = v as Record<string, unknown>;
-  if (rec.kind === 'device') return typeof rec.id === 'string';
-  if (rec.kind === 'process') {
-    return typeof rec.name === 'string'
-      && (rec.lastPid === null || typeof rec.lastPid === 'number');
-  }
-  return false;
+  return rec.kind === 'device' && typeof rec.id === 'string';
 }
 
 /**
- * 音频源规范化（幂等）：`audio.source` 合法时原样返回；缺失/形状非法时
- * 按旧裸字符串 `audio.sourceId` 解释为设备源（`''` = 默认设备）。
- * 旧键 `sourceId` 由调用方保留不改写，规范化后不再读取。
+ * 音频源规范化（幂等）：`audio.source` 为合法设备源时原样返回；否则按旧裸字符串
+ * `audio.sourceId` 解释为设备源（`''` = 默认设备）。回退前的进程源形态
+ * （`{kind:'process'}`）及缺失/非法形状一律回落默认设备。旧键 `sourceId`
+ * 由调用方保留不改写，规范化后不再读取。
  */
 export function resolveAudioSection(raw: unknown): { source: AudioSourcePref; changed: boolean } {
   const rec = (raw !== null && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
@@ -151,40 +147,53 @@ export function resolveAudioSection(raw: unknown): { source: AudioSourcePref; ch
   return { source: { kind: 'device', id: legacyId }, changed: true };
 }
 
-/** 音频源稳定键（对齐会话级幂等/同值比较）：device:<id> / process:<name> */
+/** 音频源稳定键（对齐会话级幂等/同值比较）：device:<id> */
 export function audioSourceKey(source: AudioSourcePref): string {
-  return source.kind === 'device' ? `device:${source.id}` : `process:${source.name}`;
+  return `device:${source.id}`;
 }
 
-/** 同源比较：仅比较形态与标识（进程 PID 变化不视为换源，绑定一律以列表 PID 为准） */
+/** 同源比较（设备 id 相等；`''` = 默认设备） */
 export function sameAudioSource(a: AudioSourcePref, b: AudioSourcePref): boolean {
   return audioSourceKey(a) === audioSourceKey(b);
 }
 
-/** 展示/会话历史标签：设备源=id（`''` = 整个系统），进程源=进程名 */
+/** 展示/会话历史标签：设备源=id（`''` = 整个系统） */
 export function audioSourceLabel(source: AudioSourcePref): string {
-  return source.kind === 'device' ? source.id : source.name;
+  return source.id;
 }
 
-/** store 偏好 → 线上目标；进程源缺 PID（理论不可达）时返回 null（不可下发） */
-export function audioSourceToTarget(pref: AudioSourcePref): AudioSourceTarget | null {
-  if (pref.kind === 'device') return { kind: 'device', id: pref.id };
-  return pref.lastPid === null ? null : { kind: 'process', pid: pref.lastPid, name: pref.name };
+/** store 偏好 → 线上目标 */
+export function audioSourceToTarget(pref: AudioSourcePref): AudioSourceTarget {
+  return { kind: 'device', id: pref.id };
 }
 
-/** 线上目标 → store 偏好（进程 pid → lastPid 持久化） */
+/** 线上目标 → store 偏好 */
 export function audioSourceFromTarget(target: AudioSourceTarget): AudioSourcePref {
-  return target.kind === 'device'
-    ? { kind: 'device', id: target.id }
-    : { kind: 'process', name: target.name, lastPid: target.pid };
+  return { kind: 'device', id: target.id };
 }
 
-/** 线上目标同值比较（含 PID：同名不同实例视为换源） */
+/** 线上目标同值比较（设备 id 相等） */
 export function sameAudioTarget(a: AudioSourceTarget, b: AudioSourceTarget): boolean {
-  if (a.kind === 'device' || b.kind === 'device') {
-    return a.kind === 'device' && b.kind === 'device' && a.id === b.id;
-  }
-  return a.pid === b.pid && a.name === b.name;
+  return a.id === b.id;
+}
+
+// ---------- 源语言（asr 段规范化，settings-management spec「Whisper 档位偏好迁移」） ----------
+
+function isSourceLanguage(v: unknown): v is SourceLanguage {
+  return v === 'ja' || v === 'zh' || v === 'en';
+}
+
+/**
+ * asr 段规范化（幂等）：旧 store 的 Whisper 档位字段（`model`/`model_size`）随档位
+ * 替换一并移除，改写为 `{ language }`；非法/缺失 language 回退默认 `ja`。
+ * 返回 changed=false 时调用方 MUST NOT 重写（保留用户未涉及键的原始形态）。
+ */
+export function resolveAsrSection(raw: unknown): { language: SourceLanguage; changed: boolean } {
+  const rec = (raw !== null && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const language = isSourceLanguage(rec.language) ? rec.language : DEFAULT_SOURCE_LANGUAGE;
+  const changed = !isSourceLanguage(rec.language)
+    || 'model' in rec || 'model_size' in rec;
+  return { language, changed };
 }
 
 // ---------- 旧 config.yaml → store 一次性迁移 ----------
@@ -267,12 +276,14 @@ export function planLegacyYamlMigration(yamlText: string): LegacyMigrationPlan |
     const map: Array<[string, string]> = [
       ['toggle_pause', 'shortcuts.togglePause'],
       ['switch_language', 'shortcuts.switchLanguage'],
-      ['switch_model', 'shortcuts.switchModel'],
       ['toggle_lock', 'shortcuts.toggleLock']
     ];
     for (const [yamlKey, storeKey] of map) {
       const v = shortcuts[yamlKey];
       if (typeof v === 'string' && v.length > 0) entries.push({ key: storeKey, value: v });
+    }
+    if (shortcuts.switch_model !== undefined) {
+      notes.push('shortcuts.switch_model 随 Whisper 档位移除，忽略');
     }
   }
 

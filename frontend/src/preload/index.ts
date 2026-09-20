@@ -10,7 +10,7 @@ import type { AppConfig } from '../main/config-migration';
 import type {
   Intent, ToastMessage, WsResponse, EnvInfo, DisplayInfo
 } from '../shared/ipc-types';
-import type { SubtitleMessage } from '../shared/ipc-types';
+import type { SubtitleStreamEvent } from '../shared/ipc-types';
 import type { UpdateEvent } from '../main/updater';
 
 type Unsubscribe = () => void;
@@ -35,7 +35,7 @@ contextBridge.exposeInMainWorld('appAPI', {
     subscribe('app:configChanged', cb),
 
   // 流事件
-  onSubtitle: (cb: (subtitle: SubtitleMessage) => void): Unsubscribe =>
+  onSubtitle: (cb: (subtitle: SubtitleStreamEvent) => void): Unsubscribe =>
     subscribe('app:subtitle', cb),
   onToast: (cb: (toast: ToastMessage) => void): Unsubscribe =>
     subscribe('app:toast', cb),

@@ -1,40 +1,24 @@
 """
-音频捕获模块 - 双通道音频源（设备回环 / 按进程回环）
+音频捕获模块 - WASAPI 回环设备捕获
 
-- 设备级：soundcard WASAPI 回环捕获（默认源，行为与既有版本一致）。
-- 进程级：``process_loopback.ProcessLoopbackCapture`` 捕获目标进程树（含子进程），
-  以 48kHz/stereo/float32 原始帧回调，经既有 ``_process_audio`` 单声道化 +
-  soxr 重采样至 16kHz，回调契约与设备源完全一致。
+soundcard 枚举回环设备并按选定设备（``''``=默认回环设备）开流；
+音频经 ``_process_audio`` 单声道化 + soxr 重采样至 16kHz。
 
 回调为同步函数，直接在录音线程中被调用（只写环形缓冲，不做重活）。
 暂停期间继续读取音频流但直接丢弃，避免 WASAPI 缓冲区溢出。
 """
 import asyncio
 import logging
-import threading
 from typing import Callable, List, Optional
 
 import numpy as np
-import psutil
 import soundcard as sc
 import soxr
-
-from process_loopback import (
-    ProcessLoopbackCapture,
-    supported as process_loopback_supported,
-)
 
 logger = logging.getLogger(__name__)
 
 # 音频数据回调类型：同步函数，参数为 float32 单声道 16kHz 音频
 AudioCallback = Callable[[np.ndarray], None]
-
-# 进程回环固定交付格式（模块请求 48kHz/stereo/float32）
-PROCESS_SAMPLE_RATE = 48000
-
-# watchdog 轮询周期（秒）；create_time 容差用于 PID 复用判定
-WATCHDOG_INTERVAL_S = 2.0
-_CREATE_TIME_TOLERANCE = 1e-6
 
 
 class AudioCapture:
@@ -44,7 +28,7 @@ class AudioCapture:
         self.config = config.get('audio', {})
         self.sample_rate = self.config.get('sample_rate', 16000)
         self.channels = self.config.get('channels', 1)
-        self.chunk_size = self.config.get('chunk_size', 1024)
+        self.chunk_size = self.config.get('chunk_size', 512)
 
         self._microphone: Optional[sc.Microphone] = None
         self._recorder: Optional[sc.Recorder] = None
@@ -53,19 +37,8 @@ class AudioCapture:
         self._paused = False
         self._record_task: Optional[asyncio.Task] = None
 
-        # 音频源状态：device（默认）/ process
-        self._source_kind: str = 'device'
+        # 音频源状态：设备回环（`_device_id=''` = 默认回环设备）
         self._device_id: str = ''
-        self._process_pid: Optional[int] = None
-        self._process_name: Optional[str] = None
-        self._process_create_time: Optional[float] = None
-        self._process_capture: Optional[ProcessLoopbackCapture] = None
-
-        # 进程源 watchdog（暂停期间保持存活）
-        self._watchdog_thread: Optional[threading.Thread] = None
-        self._watchdog_stop: Optional[threading.Event] = None
-        self._watchdog_interval_s: float = WATCHDOG_INTERVAL_S
-        self._on_source_lost: Optional[Callable[[str, int], None]] = None
 
     def get_audio_sources(self) -> List[dict]:
         """
@@ -93,12 +66,12 @@ class AudioCapture:
 
     def set_audio_source(self, source):
         """
-        设置音频源（结构化或旧格式裸字符串）
+        设置音频源（设备-only 结构化；兼容旧格式裸字符串）
 
         Args:
-            source: ``{'kind':'device','id'}`` | ``{'kind':'process','pid','name'}``；
-                旧格式设备 id 裸字符串继续被接受（``''``=默认回环设备）。
-                None 视为非法。
+            source: ``{'kind':'device','id'}``（``id=''``=默认回环设备）；
+                旧格式设备 id 裸字符串继续被接受。其余形态
+                （如 ``kind:'process'``）一律视为非法；None 视为非法。
 
         Raises:
             ValueError: 目标非法；失败时当前源保持不变。
@@ -107,16 +80,10 @@ class AudioCapture:
             raise ValueError('未提供音频源')
         if isinstance(source, str):
             source = {'kind': 'device', 'id': source}
-        if not isinstance(source, dict):
+        if not isinstance(source, dict) or source.get('kind', 'device') != 'device':
             raise ValueError(f'非法的音频源格式: {source!r}')
 
-        kind = source.get('kind', 'device')
-        if kind == 'device':
-            self._set_device_source(source.get('id') or '')
-        elif kind == 'process':
-            self._set_process_source(source)
-        else:
-            raise ValueError(f'未知的音频源类型: {kind!r}')
+        self._set_device_source(source.get('id') or '')
 
     def _set_device_source(self, device_id: str):
         """切换到设备源；``device_id=''`` 表示默认回环设备。先校验、后落状态。"""
@@ -134,62 +101,13 @@ class AudioCapture:
                 return
         raise ValueError(f"未找到音频源: {device_id}")
 
-    def _set_process_source(self, source: dict):
-        """切换到进程源；校验门控 + PID 存活 + 名称匹配后落状态（含 create_time）。"""
-        pid = source.get('pid')
-        name = source.get('name')
-        if not isinstance(pid, int) or pid <= 0:
-            raise ValueError(f'非法的进程 PID: {pid!r}')
-        if not isinstance(name, str) or not name:
-            raise ValueError('进程源缺少名称')
-        if not process_loopback_supported():
-            raise ValueError(
-                '当前系统不支持按应用捕获（需 Windows 10 2004 / Build 19041+）'
-            )
-
-        try:
-            proc = psutil.Process(pid)
-            actual_name = proc.name()
-            create_time = proc.create_time()
-        except psutil.NoSuchProcess:
-            raise ValueError(f'进程不存在: {name} (pid={pid})')
-        except Exception as e:  # noqa: BLE001 - 权限/僵尸进程等一律视为不可用
-            raise ValueError(f'无法访问进程 {name} (pid={pid}): {e}')
-
-        if actual_name.lower() != name.lower():
-            raise ValueError(
-                f'进程名称不匹配: 期望 {name}，实际 {actual_name} (pid={pid})'
-            )
-
-        self._source_kind = 'process'
-        self._device_id = ''
-        self._microphone = None
-        self._process_pid = int(pid)
-        self._process_name = name
-        self._process_create_time = float(create_time)
-        logger.info(f"已设置音频源: 进程 {name} (pid={pid})")
-
     def _reset_to_device(self, device_id: str):
-        """清空进程源状态并回到设备源（device_id='' 为默认设备）。"""
-        self._source_kind = 'device'
+        """回到设备源（device_id='' 为默认设备）；清空已选麦克风待 start 时重选。"""
         self._device_id = device_id or ''
         self._microphone = None
-        self._process_pid = None
-        self._process_name = None
-        self._process_create_time = None
-
-    def set_source_lost_callback(self, callback: Optional[Callable[[str, int], None]]):
-        """注入进程源退出回调（由 watchdog 线程触发，回调方负责切回事件循环）。"""
-        self._on_source_lost = callback
 
     def get_current_source(self) -> dict:
-        """返回当前运行源的协议形状（供 get_config 回传 / 前端对齐）。"""
-        if self._source_kind == 'process' and self._process_pid is not None:
-            return {
-                'kind': 'process',
-                'name': self._process_name,
-                'pid': self._process_pid,
-            }
+        """返回当前源的协议形状（供 get_config 回传 / 前端对齐）。"""
         return {'kind': 'device', 'id': self._device_id or ''}
 
     def _resample_audio(self, audio: np.ndarray, original_rate: int) -> np.ndarray:
@@ -254,7 +172,7 @@ class AudioCapture:
 
     async def start(self, callback: AudioCallback):
         """
-        开始音频捕获（按当前源类型分派：设备回环 / 按进程回环）
+        开始音频捕获（回环设备）
 
         Args:
             callback: 音频数据回调（同步函数，在录音线程中直接调用，
@@ -268,10 +186,7 @@ class AudioCapture:
         self._running = True
         self._paused = False
 
-        if self._source_kind == 'process':
-            await self._start_process_capture()
-        else:
-            await self._start_device_capture()
+        await self._start_device_capture()
 
     def _pick_default_loopback(self, loopback_mics):
         """选择"整个系统"默认回环设备。
@@ -314,48 +229,6 @@ class AudioCapture:
         # 录音循环放后台线程，start 立即返回（不得阻塞启动序列）
         self._record_task = asyncio.create_task(asyncio.to_thread(self._record_loop))
 
-    async def _start_process_capture(self):
-        """进程回环捕获；启动失败回退默认设备源（不冒泡，保证启动/切换不崩）。"""
-        pid = self._process_pid
-        name = self._process_name
-
-        if not process_loopback_supported():
-            logger.warning("当前系统不支持按进程捕获，回退默认设备源")
-            self._reset_to_device('')
-            await self._start_device_capture()
-            return
-
-        capture = ProcessLoopbackCapture(pid, self._on_process_audio)
-        try:
-            # ProcessLoopbackCapture.start 同步阻塞至激活完成 → 移出事件循环
-            await asyncio.to_thread(capture.start)
-        except Exception as e:  # noqa: BLE001 - 门控/激活失败均回退
-            logger.error(
-                f"进程回环捕获启动失败（{name} pid={pid}），回退默认设备源: {e}"
-            )
-            self._reset_to_device('')
-            await self._start_device_capture()
-            return
-
-        self._process_capture = capture
-        self._arm_watchdog()
-        logger.info(f"开始音频捕获（进程 {name} pid={pid}）")
-
-    def _on_process_audio(self, audio: np.ndarray):
-        """进程回环回调（捕获线程）：复用 _process_audio（单声道 + soxr→16k）。"""
-        if self._paused:
-            return
-        try:
-            processed = self._process_audio(audio, PROCESS_SAMPLE_RATE)
-        except Exception as e:
-            logger.error(f"进程音频处理错误: {e}")
-            return
-        if self._callback:
-            try:
-                self._callback(processed)
-            except Exception as e:
-                logger.error(f"音频回调错误: {e}")
-
     def _record_loop(self):
         """录音循环（在独立线程中运行）"""
         try:
@@ -383,9 +256,8 @@ class AudioCapture:
             self._running = False
 
     async def stop(self):
-        """停止音频捕获（等待录音线程退出；含进程流与 watchdog）"""
+        """停止音频捕获（等待录音线程退出）"""
         self._running = False
-        self._disarm_watchdog()
 
         if self._record_task:
             try:
@@ -393,15 +265,6 @@ class AudioCapture:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
             self._record_task = None
-
-        capture = self._process_capture
-        self._process_capture = None
-        if capture is not None:
-            try:
-                # ProcessLoopbackCapture.stop 同步 join（≤2s）→ 移出事件循环
-                await asyncio.to_thread(capture.stop)
-            except Exception as e:  # noqa: BLE001 - 停止失败不阻断
-                logger.error(f"停止进程回环捕获失败: {e}")
 
         logger.info("音频捕获已停止")
 
@@ -415,68 +278,6 @@ class AudioCapture:
         await self.start(callback)
         if was_paused:
             self.pause()
-
-    # ------------------------------------------------------------------ #
-    # 进程源 watchdog：PID 存活 + create_time 复核（防 PID 复用）
-    # ------------------------------------------------------------------ #
-
-    def _arm_watchdog(self):
-        """武装进程源 watchdog（暂停期间保持存活）。"""
-        self._disarm_watchdog()
-        if self._source_kind != 'process' or self._process_pid is None:
-            return
-
-        stop_event = threading.Event()
-        self._watchdog_stop = stop_event
-        pid = self._process_pid
-        name = self._process_name
-        expected_create_time = self._process_create_time
-        interval = self._watchdog_interval_s
-
-        def _watch():
-            while not stop_event.wait(interval):
-                lost = False
-                try:
-                    proc = psutil.Process(pid)
-                    create_time = proc.create_time()
-                    if (
-                        expected_create_time is None
-                        or abs(create_time - expected_create_time) > _CREATE_TIME_TOLERANCE
-                    ):
-                        lost = True
-                except psutil.NoSuchProcess:
-                    lost = True
-                except Exception:  # noqa: BLE001 - 瞬时异常不误判
-                    logger.debug("watchdog 检测异常（忽略本次）", exc_info=True)
-
-                if lost:
-                    logger.info(f"进程音频源已退出: {name} (pid={pid})")
-                    self._notify_source_lost(name, pid)
-                    return
-
-        thread = threading.Thread(
-            target=_watch, name=f'process-watchdog-{pid}', daemon=True
-        )
-        self._watchdog_thread = thread
-        thread.start()
-
-    def _disarm_watchdog(self):
-        """解除 watchdog（不阻塞：置事件后由线程自行退出）。"""
-        stop_event = self._watchdog_stop
-        self._watchdog_stop = None
-        self._watchdog_thread = None
-        if stop_event is not None:
-            stop_event.set()
-
-    def _notify_source_lost(self, name: Optional[str], pid: Optional[int]):
-        """在 watchdog 线程触发注入回调；异常不得冒泡。"""
-        callback = self._on_source_lost
-        if callback is None:
-            return
-        try:
-            callback(name, pid)
-        except Exception:  # noqa: BLE001
-            logger.exception("音频源退出回调异常")
 
     def pause(self):
         """暂停音频捕获（继续读流但丢弃）"""

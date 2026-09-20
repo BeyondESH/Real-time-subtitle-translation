@@ -4,8 +4,6 @@ import { Captions, Check, SkipForward } from 'lucide-react';
 import { Button, ProgressBar, Select } from '../components/ui';
 import { useAppState } from '../state/hooks';
 import {
-  AUDIO_APPS_EMPTY_HINT,
-  AUDIO_APPS_UNSUPPORTED_HINT,
   buildAudioSourceList,
   decodeAudioSource,
   fetchAudioSources,
@@ -43,18 +41,10 @@ export function OnboardingPage() {
         if (!alive) return;
         setAudioData(data);
         const list = buildAudioSourceList(data);
-        if (data.deviceError && data.processError) {
-          setAudioHint('列表暂不可用（后端未就绪/未连接），可稍后在设置中调整');
-        } else if (data.processError) {
-          setAudioHint(`应用列表暂不可用：${data.processError}，可稍后在设置中调整`);
-        } else if (data.deviceError) {
+        if (data.deviceError) {
           setAudioHint(`设备列表暂不可用：${data.deviceError}，可稍后在设置中调整`);
-        } else if (!list.appsSupported) {
-          setAudioHint('当前系统仅支持"整个系统"回环捕获');
         } else {
-          setAudioHint(
-            `发现 ${list.apps.length} 个正在发声的应用、${list.devices.length} 个回环设备`
-          );
+          setAudioHint(`发现 ${list.devices.length} 个回环设备`);
         }
       })
       .catch((e: unknown) => {
@@ -121,8 +111,7 @@ export function OnboardingPage() {
             <div className="flex flex-col gap-4">
               <h1 className="text-xl font-semibold text-primary">选择音频源</h1>
               <p className="text-base text-secondary">
-                字幕来自"回环捕获"——你听到的声音就是字幕的输入。默认"整个系统"即可用于绝大多数场景；
-                也可只捕获某个应用的声音。
+                字幕来自"回环捕获"——你听到的声音就是字幕的输入。默认设备即可用于绝大多数场景。
               </p>
               <Select
                 options={audioList ? toSelectOptions(audioList) : []}
@@ -130,20 +119,13 @@ export function OnboardingPage() {
                 onChange={setSelectedKey}
                 disabled={audioList === null}
               />
-              {audioList && !audioData?.processError && !audioList.appsSupported && (
-                <p className="text-xs text-secondary opacity-60">{AUDIO_APPS_UNSUPPORTED_HINT}</p>
-              )}
-              {audioList && !audioData?.processError && audioList.appsSupported
-                && audioList.apps.length === 0 && (
-                <p className="text-xs text-secondary opacity-60">{AUDIO_APPS_EMPTY_HINT}</p>
-              )}
               <p className="text-xs text-secondary opacity-60">{audioHint || ' '}</p>
               <div className="mt-2 flex items-center justify-between">
                 {skip}
                 <Button
                   variant="primary"
                   onClick={() => {
-                    // 仅当选择了非默认源时下发；默认"整个系统"保持后端默认
+                    // 仅当选择了非默认设备时下发；默认回环设备保持后端默认
                     if (selectedKey && audioList && selectedKey !== audioList.system.key) {
                       const source = decodeAudioSource(selectedKey);
                       if (source) {

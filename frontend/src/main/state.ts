@@ -38,8 +38,8 @@ export interface AppState {
   activeLanguage: string;
   targetLanguages: string[];
   /**
-   * 当前音频源的显示层标识：设备源=设备 id（'' = 整个系统/默认设备），
-   * 进程源=进程名。退出回退（audio_source_lost）与对齐失败重置均归约到 ''。
+   * 当前音频源的显示层标识：设备 id（'' = 默认回环设备/整个系统）；
+   * 对齐失败重置归约到 ''。
    */
   audioSource: string;
   locked: boolean;

@@ -11,12 +11,15 @@
   探针与静默降级语义经 device_support（no_cuda / load_failed / runtime_failed）。
 
 对外接口保持与旧实现兼容：translate / change_device / get_model_info；
-新增 is_ready / change_llm / ensure_default / set_health_callback / stop。
+新增 is_ready / change_llm / translate_with_metrics / ensure_default /
+set_health_callback / stop。
 """
 import asyncio
+import json
 import logging
 import re
-from typing import Callable, Dict, List, Optional, Tuple
+import time
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -85,12 +88,23 @@ _ECHO_MARKERS = (
 _REPEAT_NGRAM = 8
 _REPEAT_LIMIT = 3
 
+# 流式渐进推送（design.md D2/D6）：持有缓冲 / 终止标点 / 节流阈值
+# 均为模块常量，测试经 monkeypatch 注入；函数内经模块作用域引用以支持覆盖
+_STREAM_HOLD_BACK_CHARS = 8
+_STREAM_SENTENCE_END = '。！？…\n'
+_STREAM_MIN_INTERVAL_MS = 50
+_STREAM_MIN_CHARS = 2
+
 # 旧 config.yaml 键（design.md D9：一次性忽略，不重写用户文件）
 _LEGACY_KEYS = ('primary_model', 'fallback_model', 'lazy_load', 'preload_primary')
 
 
 class TranslationDegenerateError(RuntimeError):
     """净化与重试后仍判定为退化输出（不计入引擎健康失败，走失败占位）"""
+
+
+class _StreamRepeatAbort(Exception):
+    """流式生成中检测到复读循环的内部中止信号（退出流上下文即关闭连接）"""
 
 
 def _has_repeat_loop(text: str) -> bool:
@@ -111,6 +125,17 @@ def _looks_like_instruction_echo(text: str) -> bool:
     """指令回显检测（输出混入 prompt 指令文本）"""
     lowered = text.lower()
     return any(marker.lower() in lowered for marker in _ECHO_MARKERS)
+
+
+def _extract_tps(data: dict) -> Optional[float]:
+    """从 llama-server 响应提取本次生成速度（tok/s）；缺失或非法值返回 None"""
+    timings = data.get('timings')
+    if not isinstance(timings, dict):
+        return None
+    value = timings.get('predicted_per_second')
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return float(value)
 
 
 class Translator:
@@ -151,6 +176,8 @@ class Translator:
         )
         self.n_ctx = int(self.config.get('n_ctx', 4096) or 4096)
         self.timeout_s = float(self.config.get('timeout_s', 30) or 30)
+        # 流式输出开关（design.md D8：声明=真相，缺失默认开；false 走整段路径）
+        self._stream_enabled = bool(self.config.get('stream', True))
         self.cache_root = cache_root  # None → translation_models 默认缓存根
 
         for key in _LEGACY_KEYS:
@@ -349,11 +376,22 @@ class Translator:
         await self._warmup()
 
     async def _warmup(self):
-        """spawn 后热身翻译：验证健康检查之外的真实推理链路可用"""
+        """spawn 后热身翻译：验证健康检查之外的真实推理链路可用。
+
+        流式模式下 MUST 走与生产一致的 SSE 链路：stream=true 的响应体是
+        SSE 帧（以 "data: " 开头），用非流式解析会失败并被误判为"拉起失败"
+        而错误降级 CPU（回归修复：add-llm-streaming-output 真机实测发现）。
+        """
         try:
-            await self._request_chat(
-                _WARMUP_TEXT, _WARMUP_TARGET_NAME, max_tokens=_WARMUP_MAX_TOKENS
-            )
+            if self._stream_enabled:
+                await self._request_chat_stream(
+                    _WARMUP_TEXT, _WARMUP_TARGET_NAME,
+                    max_tokens=_WARMUP_MAX_TOKENS,
+                )
+            else:
+                await self._request_chat(
+                    _WARMUP_TEXT, _WARMUP_TARGET_NAME, max_tokens=_WARMUP_MAX_TOKENS
+                )
         except Exception as e:  # noqa: BLE001 - 统一转为热身失败
             raise RuntimeError(f"翻译服务热身失败: {e}") from e
 
@@ -574,7 +612,7 @@ class Translator:
         payload = {
             'model': self._model.id,  # llama-server 单模型模式不校验取值
             'messages': build_messages(self._profile, text, target_name),
-            'stream': False,
+            'stream': self._stream_enabled,
             'max_tokens': max_tokens,
             **params,
         }
@@ -584,12 +622,14 @@ class Translator:
 
     async def _request_chat(self, text: str, target_name: str, *,
                             sampling: Optional[dict] = None,
-                            max_tokens: Optional[int] = None) -> Tuple[str, Optional[str]]:
+                            max_tokens: Optional[int] = None
+                            ) -> Tuple[str, Optional[str], Optional[float]]:
         """
         发起一次 chat 补全请求。
 
         Returns:
-            (原始输出内容, finish_reason)
+            (原始输出内容, finish_reason, tps)；tps 为该次生成的解码速度
+            （tok/s，来自 llama-server 响应 timings），缺失或非法时为 None
 
         Raises:
             httpx.HTTPError: 连接/超时/HTTP 状态异常（由调用方记失败并回占位）
@@ -606,7 +646,73 @@ class Translator:
         data = resp.json()
         choice = (data.get('choices') or [{}])[0]
         content = (choice.get('message') or {}).get('content') or ''
-        return content, choice.get('finish_reason')
+        return content, choice.get('finish_reason'), _extract_tps(data)
+
+    async def _request_chat_stream(
+        self, text: str, target_name: str, *,
+        sampling: Optional[dict] = None,
+        max_tokens: Optional[int] = None,
+        on_delta: Optional[Callable[[str], Awaitable[None]]] = None,
+    ) -> Tuple[str, Optional[str], Optional[float]]:
+        """
+        流式发起一次 chat 补全请求（SSE 逐帧消费，design.md D1）。
+
+        返回形状与 _request_chat 对齐：(累积原始输出, finish_reason, tps)。
+        - 跳过空行与 `:` 开头的保活注释行；`data: [DONE]` 终止（先于 JSON 判定）；
+        - 单帧 JSON 解析失败跳过该帧，不中断整个流；
+        - 仅累积 `choices[0].delta.content`（首帧 role/null content 忽略）；
+        - 每累积一个 content 增量回调 on_delta(累积原文)（供渐进净化推送）；
+        - tps 取自最后成功解析帧的 timings（老构建缺失时为 None）。
+
+        Raises:
+            httpx.HTTPError: 连接/超时/HTTP 状态异常（由调用方记失败并回占位）
+            _StreamRepeatAbort: on_delta 主动抛出；不在此捕获，退出 async with
+                即关闭连接（llama-server 检测断连后中止生成）
+        """
+        payload = self._build_payload(
+            text, target_name, sampling, max_tokens or self._max_tokens_for(text)
+        )
+        client = self._get_client()
+        accumulated = ''
+        finish_reason: Optional[str] = None
+        last_frame: Optional[dict] = None
+        async with client.stream(
+            "POST",
+            f"http://127.0.0.1:{self._manager.port}/v1/chat/completions",
+            json=payload,
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line or not line.strip():
+                    continue  # SSE 事件分隔空行
+                if line.startswith(':'):
+                    continue  # 保活注释行（静默期 ping）
+                if not line.startswith('data:'):
+                    continue  # 未知 SSE 字段（event/id/retry）忽略
+                data_str = line[len('data:'):].strip()
+                if data_str == '[DONE]':
+                    break  # 终止（非 JSON，先于 json.loads 判定）
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    logger.debug("跳过无法解析的流式帧: %r", data_str)
+                    continue
+                if not isinstance(data, dict):
+                    logger.debug("跳过非对象流式帧: %r", data_str)
+                    continue  # 合法 JSON 但非对象的病态帧：同样跳过不中断
+                last_frame = data
+                choice = (data.get('choices') or [{}])[0]
+                delta = choice.get('delta') or {}
+                content = delta.get('content')
+                if isinstance(content, str) and content:
+                    accumulated += content
+                    if on_delta is not None:
+                        await on_delta(accumulated)
+                frame_finish = choice.get('finish_reason')
+                if frame_finish is not None:
+                    finish_reason = frame_finish
+        tps = _extract_tps(last_frame) if last_frame is not None else None
+        return accumulated, finish_reason, tps
 
     @staticmethod
     def _purify(text: str) -> str:
@@ -668,9 +774,14 @@ class Translator:
             return '重复 n-gram 循环'
         return None
 
-    async def _translate_single(self, text: str, target_name: str) -> str:
+    async def _translate_single(
+        self, text: str, target_name: str
+    ) -> Tuple[str, Optional[float]]:
         """
         翻译到单个目标语言：净化 + 退化重试一次（提升惩罚参数）。
+
+        Returns:
+            (净化后译文, tps)；tps 为最终成功那一次生成的解码速度，缺失时为 None
 
         Raises:
             TranslationDegenerateError: 净化与重试后仍判定退化
@@ -679,7 +790,7 @@ class Translator:
         last_reason = ''
         for attempt in range(2):
             sampling = self._boost_penalties(self._profile.sampling) if attempt else None
-            raw, finish_reason = await self._request_chat(
+            raw, finish_reason, tps = await self._request_chat(
                 text, target_name, sampling=sampling
             )
             purified = self._purify(raw)
@@ -688,7 +799,86 @@ class Translator:
                 # 成功即清零连续失败计数
                 self._consecutive_failures = 0
                 self._persistent_failure_notified = False
-                return purified
+                return purified, tps
+            last_reason = reason
+            logger.warning(
+                "翻译输出退化（%s），提升惩罚参数重试一次", reason
+            )
+        raise TranslationDegenerateError(f"输出退化: {last_reason}")
+
+    async def _translate_single_stream(
+        self, text: str, target_name: str,
+        on_partial: Callable[[str, bool], Awaitable[None]],
+    ) -> Tuple[str, Optional[float]]:
+        """
+        流式翻译到单个目标语言：渐进净化推送 + 复读前移止损 + 退化重试。
+
+        - 每个 content 增量对累积原文跑 _purify，命中复读循环立即退出流上下文
+          （关闭连接中止生成）并进入重试；
+        - 持有缓冲：净化文本未达阈值且无终止标点时 MUST NOT 推送；
+        - 节流合帧：距上次推送 ≥ _STREAM_MIN_INTERVAL_MS 或新增 ≥ _STREAM_MIN_CHARS；
+          释放后首帧、流结束末帧强制推送；
+        - 重试同样流式，以同一回调继续推送（前端同标识原地替换 = 可见重写）。
+
+        Returns:
+            (净化后译文, tps)；tps 为最终成功那一次生成的解码速度，缺失时为 None
+
+        Raises:
+            TranslationDegenerateError: 净化与重试后仍判定退化
+            httpx.HTTPError: 请求超时/连接/状态异常
+        """
+        last_reason = ''
+        for attempt in range(2):
+            sampling = self._boost_penalties(self._profile.sampling) if attempt else None
+            last_pushed_text = ''
+            last_push_at = 0.0
+            pushed_this_attempt = False
+
+            async def handle_delta(raw_accumulated: str) -> None:
+                nonlocal last_pushed_text, last_push_at, pushed_this_attempt
+                purified = self._purify(raw_accumulated)
+                if _has_repeat_loop(purified):
+                    raise _StreamRepeatAbort()  # 前移止损（由本方法捕获后重试）
+                if (len(purified) < _STREAM_HOLD_BACK_CHARS
+                        and not any(ch in purified for ch in _STREAM_SENTENCE_END)):
+                    return  # 持有缓冲未释放：抑制前缀/围栏闪现
+                now = time.monotonic()
+                overdue = (now - last_push_at) >= _STREAM_MIN_INTERVAL_MS / 1000.0
+                grown = (len(purified) - len(last_pushed_text)) >= _STREAM_MIN_CHARS
+                if not (overdue or grown):
+                    return  # 合帧：未达时间/字符阈值
+                is_first = (attempt == 0 and not pushed_this_attempt)
+                await on_partial(purified, is_first)
+                last_pushed_text = purified
+                last_push_at = now
+                pushed_this_attempt = True
+
+            try:
+                raw, finish_reason, tps = await self._request_chat_stream(
+                    text, target_name, sampling=sampling, on_delta=handle_delta
+                )
+            except _StreamRepeatAbort:
+                last_reason = '复读循环（流中中止）'
+                logger.warning(
+                    "翻译流中检测到复读循环，中止本次生成并重试（attempt=%d）", attempt
+                )
+                continue
+
+            purified = self._purify(raw)
+            released = (len(purified) >= _STREAM_HOLD_BACK_CHARS
+                        or any(ch in purified for ch in _STREAM_SENTENCE_END))
+            if released and purified != last_pushed_text:
+                # 终帧强制推送（定稿前 UI 显示完整文本）
+                is_first = (attempt == 0 and not pushed_this_attempt)
+                await on_partial(purified, is_first)
+                last_pushed_text = purified
+
+            reason = self._degenerate_reason(purified, finish_reason, text)
+            if reason is None:
+                # 成功即清零连续失败计数（与 _translate_single 语义对齐）
+                self._consecutive_failures = 0
+                self._persistent_failure_notified = False
+                return purified, tps
             last_reason = reason
             logger.warning(
                 "翻译输出退化（%s），提升惩罚参数重试一次", reason
@@ -708,6 +898,9 @@ class Translator:
         """
         翻译文本到目标语言（LLM 单次调用产出；仅激活语言由管线控制）。
 
+        兼容包装：仅返回翻译结果；需要生成速度指标的调用方请用
+        translate_with_metrics。
+
         Args:
             text: 源文本
             source_language: 源语言代码（必须来自 ASR 识别结果）
@@ -716,23 +909,48 @@ class Translator:
         Returns:
             翻译结果字典 {规范化语言代码: 翻译文本}；失败目标为占位串
         """
+        results, _ = await self.translate_with_metrics(text, source_language, targets)
+        return results
+
+    async def translate_with_metrics(
+        self,
+        text: str,
+        source_language: Optional[str] = None,
+        targets: Optional[list] = None,
+        on_partial: Optional[Callable[[str, str, bool], Awaitable[None]]] = None,
+    ) -> Tuple[Dict[str, str], Dict[str, float]]:
+        """
+        翻译文本到目标语言，并返回每个成功目标的 LLM 生成速度（tok/s）。
+
+        翻译语义与 translate 完全一致；额外收集 tps 指标：仅"实际生成成功"
+        的目标产生指标（未支持语言对/占位串/请求失败均不产生）。
+
+        Args:
+            on_partial: 可选流式回调 (规范化目标语言, 净化累积译文, 是否首帧)；
+                仅 self._stream_enabled 为 true 且显式提供时推送进行中帧。
+
+        Returns:
+            (翻译结果字典 {规范化语言代码: 翻译文本},
+             生成速度字典 {规范化语言代码: tok/s})
+        """
         if not self._initialized:
             logger.error("翻译引擎未初始化")
-            return {}
+            return {}, {}
 
         if not text or not text.strip():
-            return {}
+            return {}, {}
 
         if not source_language:
             logger.warning("缺少源语言（应由 ASR 提供），跳过翻译")
-            return {}
+            return {}, {}
 
         if not self._manager.is_ready:
             logger.debug("翻译服务未就绪（预载/重启中），语句跳过")
-            return {}
+            return {}, {}
 
         src = normalize_lang(source_language)
         results: Dict[str, str] = {}
+        tps_by_lang: Dict[str, float] = {}
 
         for target_lang in (targets if targets is not None else self.target_languages):
             tgt = normalize_lang(target_lang)
@@ -743,7 +961,20 @@ class Translator:
                 results[tgt] = unsupported_pair_message(src, tgt)
                 continue
             try:
-                results[tgt] = await self._translate_single(text, target_name)
+                if self._stream_enabled:
+                    async def _forward(accumulated: str, is_first: bool,
+                                       _tgt: str = tgt) -> None:
+                        if on_partial is not None:
+                            await on_partial(_tgt, accumulated, is_first)
+
+                    purified, tps = await self._translate_single_stream(
+                        text, target_name, _forward
+                    )
+                else:
+                    purified, tps = await self._translate_single(text, target_name)
+                results[tgt] = purified
+                if tps is not None:
+                    tps_by_lang[tgt] = tps
             except TranslationDegenerateError as e:
                 logger.warning(f"翻译到 {tgt} 输出退化且重试未恢复: {e}")
                 results[tgt] = FAILURE_PLACEHOLDER
@@ -752,7 +983,7 @@ class Translator:
                 self._record_runtime_failure(str(e))
                 results[tgt] = FAILURE_PLACEHOLDER
 
-        return results
+        return results, tps_by_lang
 
     # ------------------------------------------------------------------ #
     # 模型 / 设备切换

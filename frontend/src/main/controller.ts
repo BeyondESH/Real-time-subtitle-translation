@@ -14,15 +14,12 @@ import {
   audioSourceFromTarget, audioSourceLabel, audioSourceToTarget, sameAudioTarget
 } from './config-migration';
 import type {
-  AudioSourceLostMessage, AudioSourcePref, BackendErrorMessage, DeviceStateView, GatewayLogger,
-  Intent, KnownBroadcast, ModelProgressMessage, PipelineWarningMessage, SubtitleMessage,
+  AudioSourcePref, BackendErrorMessage, DeviceStateView, GatewayLogger,
+  Intent, KnownBroadcast, ModelProgressMessage, PipelineWarningMessage,
+  SourceLanguage, SubtitleCancelMessage, SubtitleMessage, SubtitlePartialMessage,
   ToastMessage, UnknownBroadcast, VadStateMessage
 } from '../shared/ipc-types';
-import { DEFAULT_AUDIO_SOURCE } from '../shared/ipc-types';
-
-export const WHISPER_MODELS: readonly string[] = [
-  'tiny', 'base', 'small', 'medium', 'large-v3'
-];
+import { DEFAULT_AUDIO_SOURCE, ENGINE_MODEL_DISPLAY, SOURCE_LANGUAGES } from '../shared/ipc-types';
 
 /** 模型下载完成后进度态停留时长（与旧 overlay 行为等价） */
 const DONE_HIDE_MS = 3000;
@@ -49,16 +46,18 @@ export class Controller {
    * control 消息是 fire-and-forget，后端以 {type:'error', code} 回执否定时按锚点恢复。
    */
   private readonly optimistic: {
-    model?: string;
-    llm?: string;
+    /** 语言乐观锚点（set_language=目标语言 / set_source_language=源语言，二者共用 invalid_language 回执） */
+    languageAction?: 'target' | 'source';
+    sourceLanguage?: SourceLanguage;
     activeLanguage?: string;
+    llm?: string;
     audioSource?: AudioSourcePref;
     device?: 'auto' | 'cpu' | 'cuda';
     deviceState?: DeviceStateView | null;
   } = {};
 
   /**
-   * 对齐路径待确认音频源（D9）：align 下发 set_audio_source 后置位；若后端以
+   * 对齐路径待确认音频源：align 下发 set_audio_source 后置位；若后端以
    * invalid_audio_source 拒绝且无用户乐观锚点，则按"粘性回退默认设备"处理。
    */
   private pendingAlignSource: AudioSourcePref | null = null;
@@ -74,7 +73,7 @@ export class Controller {
     return {
       targetLanguages: t.targetLanguages,
       activeLanguage: t.activeLanguage,
-      model: this.deps.config.get('asr').model,
+      sourceLanguage: this.deps.config.get('asr').language,
       translationModel: t.model,
       audioSource: this.deps.config.get('audio').source,
       device: this.deps.config.get('inference').device
@@ -85,10 +84,8 @@ export class Controller {
   async align(): Promise<void> {
     const prefs = this.prefs();
     // 记录本次对齐将下发的源（默认设备不发）；无用户锚点的 invalid_audio_source
-    // 视为对齐路径拒绝 → 粘性回退默认设备（D6/D9）
-    this.pendingAlignSource = prefs.audioSource.kind === 'device' && prefs.audioSource.id === ''
-      ? null
-      : prefs.audioSource;
+    // 视为对齐路径拒绝 → 粘性回退默认设备
+    this.pendingAlignSource = prefs.audioSource.id === '' ? null : prefs.audioSource;
     const view = await alignPreferences(
       this.deps.gateway, prefs, this.deps.tracker, this.deps.logger
     );
@@ -124,14 +121,6 @@ export class Controller {
         this.toast(`目标语言: ${next}`);
         return;
       }
-      case 'cycleModel': {
-        const cur = this.prefs().model;
-        const idx = WHISPER_MODELS.indexOf(cur);
-        const next = WHISPER_MODELS[(idx + 1) % WHISPER_MODELS.length];
-        this.handle({ type: 'setModel', model: next });
-        this.toast(`切换模型: ${next}`);
-        return;
-      }
       case 'setLanguage': {
         const p = this.prefs();
         if (p.activeLanguage === intent.language) return;
@@ -142,14 +131,15 @@ export class Controller {
         this.applyActiveLanguage(intent.language);
         return;
       }
-      case 'setModel': {
-        const p = this.prefs();
-        if (p.model === intent.model) return;
-        if (!WHISPER_MODELS.includes(intent.model)) {
-          this.toast(`不支持的模型: ${intent.model}`, 'error');
+      case 'setSourceLanguage': {
+        // 源语言（识别提示 + 翻译源语言；ja/zh/en，spec: settings-management「源语言设置」）
+        if (!SOURCE_LANGUAGES.includes(intent.language)) {
+          this.toast(`不支持的源语言: ${String(intent.language)}`, 'error');
           return;
         }
-        this.applyModel(intent.model);
+        const p = this.prefs();
+        if (p.sourceLanguage === intent.language) return;
+        this.applySourceLanguage(intent.language);
         return;
       }
       case 'setLlm': {
@@ -176,9 +166,8 @@ export class Controller {
       case 'setAudioSource': {
         const prev = this.prefs().audioSource;
         const next = audioSourceFromTarget(intent.source);
-        // 同值跳过按"线上目标"比较（含 PID：同名不同实例视为换源）
-        const prevTarget = audioSourceToTarget(prev);
-        if (prevTarget !== null && sameAudioTarget(prevTarget, intent.source)) return;
+        // 同值跳过按"线上目标"比较
+        if (sameAudioTarget(audioSourceToTarget(prev), intent.source)) return;
         this.optimistic.audioSource = prev;
         this.pendingAlignSource = null; // 用户主动切换：覆盖对齐路径标记
         this.deps.gateway.send({
@@ -224,10 +213,6 @@ export class Controller {
     const next = this.prefs();
     const s = this.deps.state.getState();
     const patch: Partial<AppState> = {};
-    if (s.model !== next.model) {
-      this.optimistic.model = s.model;
-      patch.model = next.model;
-    }
     if (s.activeLanguage !== next.activeLanguage) {
       this.optimistic.activeLanguage = s.activeLanguage;
       patch.activeLanguage = next.activeLanguage;
@@ -261,6 +246,7 @@ export class Controller {
   // ---------- 内部 ----------
 
   private applyActiveLanguage(next: string): void {
+    this.optimistic.languageAction = 'target';
     this.optimistic.activeLanguage = this.deps.state.getState().activeLanguage;
     this.deps.gateway.send({ type: 'control', action: 'set_language', language: next });
     const t = this.deps.config.get('translation');
@@ -268,11 +254,12 @@ export class Controller {
     this.deps.state.dispatch({ type: 'languageChanged', activeLanguage: next });
   }
 
-  private applyModel(next: string): void {
-    this.optimistic.model = this.deps.state.getState().model;
-    this.deps.gateway.send({ type: 'control', action: 'change_model', model_size: next });
-    this.deps.config.set('asr', { model: next });
-    this.deps.state.dispatch({ type: 'modelChanged', model: next });
+  /** 源语言切换：持久化 + 下发 set_source_language（热生效；失败按锚点回退） */
+  private applySourceLanguage(next: SourceLanguage): void {
+    this.optimistic.languageAction = 'source';
+    this.optimistic.sourceLanguage = this.deps.config.get('asr').language;
+    this.deps.gateway.send({ type: 'control', action: 'set_source_language', language: next });
+    this.deps.config.set('asr', { language: next });
   }
 
   private applyLlm(next: string): void {
@@ -313,6 +300,17 @@ export class Controller {
         // 写入失败已在 HistoryStore 内记日志，不中断直播分发
         this.writeHistory(m);
         this.deps.broadcast('app:subtitle', m);
+        return;
+      }
+      case 'subtitle_partial': {
+        // 进行中帧：仅经与 subtitle 相同的 app:subtitle 通道分发（保序）；
+        // MUST NOT 落库 / 触发会话生命周期（client-gateway-state spec）
+        this.deps.broadcast('app:subtitle', msg as SubtitlePartialMessage);
+        return;
+      }
+      case 'subtitle_cancel': {
+        // 清算帧：同上，仅分发不落库
+        this.deps.broadcast('app:subtitle', msg as SubtitleCancelMessage);
         return;
       }
       case 'model_progress': {
@@ -366,17 +364,6 @@ export class Controller {
         });
         return;
       }
-      case 'audio_source_lost': {
-        // D6 粘性重置：目标进程退出 → toast + store/state 同步回默认设备，
-        // 避免"启动时进程不可用 → 对齐失败 → 回滚 → 下次再试"的重试循环
-        const lost = msg as AudioSourceLostMessage;
-        this.toast(`音频源「${lost.name}」已退出，已切换为整个系统`, 'warn');
-        this.pendingAlignSource = null;
-        this.optimistic.audioSource = undefined;
-        this.deps.config.set('audio', { source: { ...DEFAULT_AUDIO_SOURCE } });
-        this.deps.state.dispatch({ type: 'audioSourceChanged', audioSource: '' });
-        return;
-      }
       default:
         this.deps.logger.info('未路由的广播类型:', msg.type);
     }
@@ -386,16 +373,24 @@ export class Controller {
   private rollbackIfRejected(code: string | undefined): 'audio_align_reset' | null {
     switch (code) {
       case 'invalid_model': {
-        const prev = this.optimistic.model;
-        this.optimistic.model = undefined;
-        if (prev === undefined) return null;
-        this.deps.config.set('asr', { model: prev });
-        this.deps.state.dispatch({ type: 'modelChanged', model: prev });
+        // 单引擎模型语义：change_model 仅协议兼容保留，前端无乐观锚点可回退
+        this.optimistic.languageAction = undefined;
         break;
       }
       case 'invalid_language': {
+        // 二义回执：set_language（目标语言）与 set_source_language（源语言）共用
+        // invalid_language——按最近一次发送的语言动作路由回退
+        if (this.optimistic.languageAction === 'source') {
+          const prev = this.optimistic.sourceLanguage;
+          this.optimistic.sourceLanguage = undefined;
+          this.optimistic.languageAction = undefined;
+          if (prev === undefined) return null;
+          this.deps.config.set('asr', { language: prev });
+          break;
+        }
         const prev = this.optimistic.activeLanguage;
         this.optimistic.activeLanguage = undefined;
+        this.optimistic.languageAction = undefined;
         if (prev === undefined) return null;
         const t = this.deps.config.get('translation');
         this.deps.config.set('translation', { ...t, activeLanguage: prev });
@@ -413,7 +408,7 @@ export class Controller {
           });
           return null;
         }
-        // 对齐路径失败（应用未运行等）：粘性回退默认设备，后续连接不再重试
+        // 对齐路径失败（设备不可用等）：粘性回退默认设备，后续连接不再重试
         const pending = this.pendingAlignSource;
         this.pendingAlignSource = null;
         if (pending === null) return null;
@@ -479,7 +474,7 @@ export class Controller {
       sourceLang: m.source_language ?? '',
       translation,
       targetLang: m.active_language ?? '',
-      model: this.deps.state.getState().model
+      model: ENGINE_MODEL_DISPLAY
     });
 
     // 会话级变化（切分/首句自动改题）才通知侧栏，避免每条字幕触发列表刷新
@@ -508,9 +503,9 @@ function warningToastText(reason: string | undefined, message: string | undefine
     case 'stalled':
       return '识别引擎停滞，正在自动恢复…';
     case 'engine_degraded':
-      return '识别引擎已降级运行（建议换更小的模型）';
+      return '识别引擎已降级运行';
     default:
-      return '处理过载：已丢弃最旧语句（建议换更小的模型）';
+      return '处理过载：已丢弃最旧语句';
   }
 }
 

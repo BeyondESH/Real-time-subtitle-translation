@@ -37,7 +37,9 @@ class TestPipelineIntegration:
         asr.is_ready = True
         asr.transcribe = AsyncMock(return_value={'text': 'こんにちは', 'language': 'ja'})
         translator = AsyncMock()
-        translator.translate = AsyncMock(return_value={'zh': '你好'})
+        translator.translate_with_metrics = AsyncMock(
+            return_value=({'zh': '你好'}, {})
+        )
         ws = AsyncMock()
         ws.send = AsyncMock()
 
@@ -63,7 +65,7 @@ class TestPipelineIntegration:
 
             asr.transcribe.assert_called_once()
             # 源语言来自 ASR 结果（不经二次检测），targets=None 走全部配置目标
-            translator.translate.assert_called_once_with('こんにちは', 'ja', None)
+            translator.translate_with_metrics.assert_called_once_with('こんにちは', 'ja', None)
 
             subtitle_msgs = [
                 c.args[0] for c in ws.send.call_args_list

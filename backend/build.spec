@@ -8,29 +8,26 @@ from PyInstaller.utils.hooks import collect_all
 block_cipher = None
 console = os.environ.get('CONSOLE', '0') == '1'
 
-datas = [('../config.yaml', '.')]
+datas = [
+    ('../config.yaml', '.'),
+    # 内嵌 Silero VAD 资产（faster-whisper MIT 实现内嵌，MUST NOT 依赖 faster-whisper 包）
+    ('vendor/silero_vad/assets/silero_vad_v6.onnx', 'vendor/silero_vad/assets'),
+]
 binaries = []
 hiddenimports = [
     'soundcard',
     'numpy',
-    'faster_whisper',
+    'sherpa_onnx',
     'httpx',
     'websockets',
     'yaml',
     'soxr',
-    # 按进程音频捕获依赖（pycaw.__init__ 为空，需显式收集 pycaw.pycaw 以带入
-    # pycaw.api.* 子模块；comtypes.client 触发 hooks-contrib 的 comtypes 收集）
-    'comtypes',
-    'comtypes.client',
-    'pycaw',
-    'pycaw.pycaw',
-    'psutil',
     # 本地模块显式收集：免受 cwd/分析路径差异影响（曾出现 Analysis 漏收
     # audio_buffer 导致打包产物 ModuleNotFoundError 的事故）
-    'process_loopback',
     'audio_buffer',
     'audio_capture',
     'asr_engine',
+    'asr_models',
     'device_support',
     'pipeline_worker',
     'translator',
@@ -41,10 +38,12 @@ hiddenimports = [
     'language_codes',
     'vad_events',
     'websocket_server',
+    'vendor.silero_vad.vad',
 ]
 
-# 原生库与数据资产完整收集（含 faster-whisper 的 silero_vad.onnx）
-for _pkg in ('ctranslate2', 'tokenizers', 'faster_whisper', 'onnxruntime'):
+# 原生库与数据资产完整收集（sherpa-onnx 含其依赖的 onnxruntime 运行时；
+# ASR 引擎为 Fun-ASR-Nano 进程内推理，翻译经 llama.cpp 进程外运行）
+for _pkg in ('sherpa_onnx', 'onnxruntime'):
     _d, _b, _h = collect_all(_pkg)
     datas += _d
     binaries += _b
@@ -60,11 +59,12 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # 翻译引擎已迁移至 llama.cpp（llama-server sidecar）：不再分发 torch/transformers。
-        # collect_all('ctranslate2') 的 converters 子模块会【可选导入】torch/transformers
-        # （第 27/28 行 try: import），必须显式排除，否则整包被拖入（实测 +2.8GB）。
-        # sentencepiece 为 transformers 的传递可选依赖，一并排除（faster-whisper 链路不需要）。
+        # ASR 引擎已迁移至 sherpa-onnx（Fun-ASR-Nano 进程内），翻译引擎为
+        # llama.cpp 进程外（llama-server sidecar）：不再分发 torch/transformers/
+        # ctranslate2/tokenizers/faster-whisper 链路。sentencepiece 为 transformers
+        # 的传递可选依赖，一并排除。
         'torch', 'transformers', 'sentencepiece', 'torchvision', 'torchaudio',
+        'ctranslate2', 'tokenizers', 'faster_whisper',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

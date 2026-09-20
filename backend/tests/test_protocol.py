@@ -143,7 +143,9 @@ class TestActiveLanguage:
         asr.is_ready = True
         asr.transcribe = AsyncMock(return_value={'text': 'こんにちは', 'language': 'ja'})
         translator = AsyncMock()
-        translator.translate = AsyncMock(return_value={'en': 'hello'})
+        translator.translate_with_metrics = AsyncMock(
+            return_value=({'en': 'hello'}, {'en': 33.3})
+        )
         ws = AsyncMock()
         ws.send = AsyncMock()
 
@@ -166,50 +168,64 @@ class TestActiveLanguage:
             await worker.stop()
 
         # 只翻译激活语言
-        translator.translate.assert_called_once_with('こんにちは', 'ja', ['en'])
+        translator.translate_with_metrics.assert_called_once_with('こんにちは', 'ja', ['en'])
         msg = [c.args[0] for c in ws.send.call_args_list
                if c.args[0].get('type') == 'subtitle'][0]
         assert msg['active_language'] == 'en'
         assert msg['translations'] == {'en': 'hello'}
+        assert msg['tps'] == 33.3
 
 
 def _probe(cuda_available: bool, detail: str = 'test-probe') -> dict:
     return {'cuda_available': cuda_available, 'source': 'fake', 'detail': detail}
 
 
-def _fake_whisper_model():
-    """假模型：满足端到端热身验证的最小契约（transcribe → 空片段 + info）"""
-    info = types.SimpleNamespace(language='en', language_probability=1.0)
+class _FakeStream:
+    def __init__(self):
+        self._text = ''
 
-    class _FakeModel:
-        def transcribe(self, audio, **kwargs):
-            return iter(()), info
+    def accept_waveform(self, sample_rate, samples):
+        pass
 
-    return _FakeModel()
+    @property
+    def result(self):
+        return types.SimpleNamespace(text=self._text)
+
+
+class _FakeRecognizer:
+    """假识别器：满足端到端热身验证的最小契约（decode → 空文本）"""
+
+    def __init__(self, provider='cpu'):
+        self.provider = provider
+
+    def create_stream(self):
+        return _FakeStream()
+
+    def decode_stream(self, stream):
+        stream._text = ''
 
 
 class TestASREngineDevice:
-    """ASR 统一加载路径 + change_device（假加载器，无网络）"""
+    """ASR 统一加载路径 + change_device（假识别器，无网络）"""
 
     def make_engine(self, monkeypatch, cuda_available, fail_cuda=False,
                     device='auto'):
         created = []
 
-        def fake_model(model_size, device, compute_type, download_root):
-            created.append((device, compute_type))
-            if device == 'cuda' and fail_cuda:
+        def fake_builder(provider):
+            created.append(provider)
+            if provider == 'cuda' and fail_cuda:
                 raise RuntimeError(
-                    'CUDA failed with error no CUDA-capable device is detected'
+                    'CUDA provider unavailable: no CUDA-capable device'
                 )
-            return _fake_whisper_model()
+            return _FakeRecognizer(provider)
 
-        monkeypatch.setattr(asr_mod, 'WhisperModel', fake_model)
         monkeypatch.setattr(
             asr_mod, 'probe_compute', lambda: {'asr': _probe(cuda_available)}
         )
-        engine = ASREngine({
-            'asr': {'model_size': 'tiny', 'device': device, 'compute_type': 'float16'}
-        })
+        monkeypatch.setattr(asr_mod, 'is_asr_model_downloaded', lambda: True)
+        engine = ASREngine({'asr': {'device': device}})
+        monkeypatch.setattr(engine, '_build_recognizer', fake_builder)
         return engine, created
 
     async def test_auto_with_cuda_uses_gpu(self, monkeypatch):
@@ -217,14 +233,14 @@ class TestASREngineDevice:
         await engine.initialize()
         assert engine.resolved_device == 'cuda'
         assert engine.device_reason == 'auto'
-        assert created == [('cuda', 'float16')]
+        assert created == ['cuda']
 
     async def test_auto_without_cuda_uses_cpu(self, monkeypatch):
         engine, created = self.make_engine(monkeypatch, cuda_available=False)
         await engine.initialize()
         assert engine.resolved_device == 'cpu'
         assert engine.device_reason == 'no_cuda'
-        assert created == [('cpu', 'int8')]
+        assert created == ['cpu']
 
     async def test_explicit_cuda_probe_unavailable_skips_gpu(self, monkeypatch):
         engine, created = self.make_engine(
@@ -233,7 +249,7 @@ class TestASREngineDevice:
         await engine.initialize()
         assert engine.resolved_device == 'cpu'
         assert engine.device_reason == 'no_cuda'
-        assert created == [('cpu', 'int8')]  # 未尝试注定失败的 GPU 加载
+        assert created == ['cpu']  # 未尝试注定失败的 GPU 加载
 
     async def test_explicit_cpu_never_tries_gpu(self, monkeypatch):
         engine, created = self.make_engine(
@@ -242,7 +258,7 @@ class TestASREngineDevice:
         await engine.initialize()
         assert engine.resolved_device == 'cpu'
         assert engine.device_reason == 'user'
-        assert created == [('cpu', 'int8')]
+        assert created == ['cpu']
 
     @pytest.mark.parametrize('device', ['auto', 'cuda'])
     async def test_gpu_load_failure_silent_degrade(self, monkeypatch, caplog, device):
@@ -254,7 +270,7 @@ class TestASREngineDevice:
 
         assert engine.resolved_device == 'cpu'
         assert engine.device_reason == 'load_failed'
-        assert created == [('cuda', 'float16'), ('cpu', 'int8')]
+        assert created == ['cuda', 'cpu']
         assert any('降级' in r.message for r in caplog.records)
 
     async def test_change_device_invalid_raises(self, monkeypatch):
@@ -280,7 +296,7 @@ class TestASREngineDevice:
         assert engine.device == 'cpu'
         assert engine.resolved_device == 'cpu'
         assert engine.device_reason == 'user'
-        assert created == [('cpu', 'int8'), ('cpu', 'int8')]
+        assert created == ['cpu', 'cpu']
 
     async def test_change_device_to_cuda_without_probe_degrades(self, monkeypatch):
         engine, created = self.make_engine(monkeypatch, cuda_available=False)
@@ -291,7 +307,7 @@ class TestASREngineDevice:
         assert engine.resolved_device == 'cpu'
         assert engine.device_reason == 'no_cuda'
         # 未新增 GPU 尝试
-        assert ('cuda', 'float16') not in created
+        assert 'cuda' not in created
 
     def test_get_model_info_keeps_preference_and_adds_resolved(self, monkeypatch):
         engine, _ = self.make_engine(monkeypatch, cuda_available=True)
@@ -300,6 +316,11 @@ class TestASREngineDevice:
         assert info['resolved_device'] is None
         assert info['device_reason'] is None
         assert 'resolved_device' in info and 'device_reason' in info
+        # 单引擎模型语义（无 Whisper 档位字段）
+        assert info['model'] == 'funasr-nano'
+        assert info['language'] == 'ja'
+        assert 'model_size' not in info
+        assert 'supported_models' not in info
 
 
 class _FakeLlamaManager:
@@ -595,17 +616,16 @@ class TestDeviceControl:
             await app.stop()
 
     async def test_runtime_degraded_broadcasts_state_and_warning(self):
-        """运行期降级（runtime_failed）→ device_state + engine_degraded 告警（含降档建议）"""
+        """运行期降级（runtime_failed）→ device_state + engine_degraded 告警"""
         app = self.make_app()
         app.asr_engine._resolved_device = 'cpu'
         app.asr_engine._device_reason = 'runtime_failed'
-        app.asr_engine.model_size = 'large-v3'
 
         await app._handle_asr_health({
             'event': 'runtime_degraded',
             'resolved': 'cpu',
             'reason': 'runtime_failed',
-            'model_size': 'large-v3',
+            'model': 'funasr-nano',
         })
 
         msgs = self.sent(app)
@@ -620,27 +640,8 @@ class TestDeviceControl:
             'engine': 'asr', 'from': 'cuda', 'to': 'cpu',
             'device_reason': 'runtime_failed',
         }
-        assert '建议切换到 base/small' in warnings[0]['message']
+        assert '自动回退 CPU' in warnings[0]['message']
         assert 'dropped' in warnings[0]
-
-    async def test_runtime_degraded_light_model_has_no_suggestion(self):
-        """非重档模型不附加降档建议"""
-        app = self.make_app()
-        app.asr_engine._resolved_device = 'cpu'
-        app.asr_engine._device_reason = 'runtime_failed'
-
-        await app._handle_asr_health({
-            'event': 'runtime_degraded',
-            'resolved': 'cpu',
-            'reason': 'runtime_failed',
-            'model_size': 'base',
-        })
-
-        warnings = [
-            m for m in self.sent(app) if m.get('type') == 'pipeline_warning'
-        ]
-        assert len(warnings) == 1
-        assert '建议切换' not in warnings[0]['message']
 
     async def test_persistent_failure_warning_payload(self):
         """CPU 持续失败 → 仅 engine_degraded 告警，无 device_state"""
@@ -657,6 +658,131 @@ class TestDeviceControl:
         assert len(warnings) == 1
         assert warnings[0]['reason'] == 'engine_degraded'
         assert warnings[0]['detail']['failures'] == 3
+
+
+class TestModelAndSourceLanguageControl:
+    """change_model（单引擎语义）与 set_source_language 控制分发"""
+
+    def make_app(self):
+        app = SubtitleTranslator(config_path='nonexistent-config.yaml')
+        app.websocket_server.send = AsyncMock()
+        return app
+
+    @staticmethod
+    def sent(app):
+        return [c.args[0] for c in app.websocket_server.send.call_args_list]
+
+    async def test_change_model_invalid_receipt(self):
+        """旧档位名等其他值 → invalid_model 回执（协议兼容）"""
+        app = self.make_app()
+        app.asr_engine = AsyncMock()
+        app.asr_engine.change_model = AsyncMock(side_effect=ValueError('不支持'))
+
+        await app._on_control_message({
+            'type': 'control', 'action': 'change_model', 'model_size': 'small'
+        })
+
+        errors = [m for m in self.sent(app) if m.get('type') == 'error']
+        assert errors and errors[0]['code'] == 'invalid_model'
+        app.asr_engine.change_model.assert_awaited_once_with('small')
+
+    async def test_change_model_valid_idempotent(self):
+        app = self.make_app()
+        app.asr_engine = AsyncMock()
+
+        await app._on_control_message({
+            'type': 'control', 'action': 'change_model', 'model_size': 'funasr-nano'
+        })
+
+        app.asr_engine.change_model.assert_awaited_once_with('funasr-nano')
+        assert not [m for m in self.sent(app) if m.get('type') == 'error']
+
+    async def test_set_source_language_valid(self):
+        app = self.make_app()
+
+        await app._on_control_message({
+            'type': 'control', 'action': 'set_source_language', 'language': 'zh'
+        })
+
+        assert app.asr_engine.source_language == 'zh'
+        assert not [m for m in self.sent(app) if m.get('type') == 'error']
+
+    async def test_set_source_language_invalid_receipt(self):
+        """非法语言 → invalid_language 回执，源语言保持不变"""
+        app = self.make_app()
+
+        await app._on_control_message({
+            'type': 'control', 'action': 'set_source_language', 'language': 'ko'
+        })
+
+        assert app.asr_engine.source_language == 'ja'  # 未变
+        errors = [m for m in self.sent(app) if m.get('type') == 'error']
+        assert errors and errors[0]['code'] == 'invalid_language'
+
+    async def test_get_config_asr_section_single_model_shape(self):
+        """get_config asr 段：model/language 字段，无 Whisper 档位字段"""
+        app = self.make_app()
+        result = await app._method_get_config(None)
+        asr = result['asr']
+        assert asr['model'] == 'funasr-nano'
+        assert asr['language'] == 'ja'
+        assert 'resolved_device' in asr
+        assert 'device_reason' in asr
+        assert 'model_size' not in asr
+        assert 'supported_models' not in asr
+
+
+class TestAudioSourceControl:
+    """set_audio_source 控制分发（设备-only 结构化；进程形态已随回退移除）"""
+
+    def make_app(self):
+        app = SubtitleTranslator(config_path='nonexistent-config.yaml')
+        app.websocket_server.send = AsyncMock()
+        return app
+
+    @staticmethod
+    def sent(app):
+        return [c.args[0] for c in app.websocket_server.send.call_args_list]
+
+    async def test_device_source_switch_accepted(self):
+        """结构化设备源（id=''=默认设备）被接受，无错误回执"""
+        app = self.make_app()
+        await app._on_control_message({
+            'type': 'control', 'action': 'set_audio_source',
+            'source': {'kind': 'device', 'id': ''}
+        })
+        assert not any(m.get('type') == 'error' for m in self.sent(app))
+        assert app.audio_capture.get_current_source() == {'kind': 'device', 'id': ''}
+
+    async def test_legacy_source_id_accepted(self):
+        """旧格式裸设备 id（''）继续按设备源接受"""
+        app = self.make_app()
+        await app._on_control_message({
+            'type': 'control', 'action': 'set_audio_source', 'source_id': ''
+        })
+        assert not any(m.get('type') == 'error' for m in self.sent(app))
+
+    async def test_process_source_shape_rejected(self):
+        """回退后进程形态一律 invalid_audio_source，且不改变当前源"""
+        app = self.make_app()
+        await app._on_control_message({
+            'type': 'control', 'action': 'set_audio_source',
+            'source': {'kind': 'process', 'pid': 1234, 'name': 'chrome.exe'}
+        })
+        errors = [m for m in self.sent(app) if m.get('type') == 'error']
+        assert len(errors) == 1
+        assert errors[0]['code'] == 'invalid_audio_source'
+        assert app.audio_capture.get_current_source() == {'kind': 'device', 'id': ''}
+
+    async def test_missing_source_is_invalid(self):
+        """缺少 source/source_id → invalid_audio_source"""
+        app = self.make_app()
+        await app._on_control_message({
+            'type': 'control', 'action': 'set_audio_source'
+        })
+        errors = [m for m in self.sent(app) if m.get('type') == 'error']
+        assert len(errors) == 1
+        assert errors[0]['code'] == 'invalid_audio_source'
 
 
 class TestChangeLlmControl:

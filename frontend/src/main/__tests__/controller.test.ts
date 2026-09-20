@@ -152,8 +152,8 @@ function makeHarness(): Harness {
   const socket = FakeSocket.all[0];
   socket.openNow();
   const req = socket.sentJson().find((f) => f.type === 'request');
-  const model = (config.get('asr') as { model: string }).model;
-  socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: model } } });
+  const language = (config.get('asr') as { language: string }).language;
+  socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { language } } });
 
   return {
     controller, state, socket, broadcasts, config, history, gateway,
@@ -187,7 +187,7 @@ describe('广播路由 → 历史落库（session-history spec）', () => {
       targetLang: 'zh',
       tsStart: 1.5,
       tsEnd: 3.25,
-      model: 'base'
+      model: 'Fun-ASR-Nano'
     });
     expect(h.broadcasts.some((b) => b.channel === 'app:subtitle')).toBe(true);
     // 首句 → 会话级刷新广播（供侧栏改题）
@@ -229,6 +229,64 @@ describe('广播路由 → 历史落库（session-history spec）', () => {
   });
 });
 
+describe('流式字幕路由（add-llm-streaming-output）', () => {
+  const PARTIAL = {
+    type: 'subtitle_partial',
+    id: 'u42',
+    original: 'こんにちは',
+    source_language: 'ja',
+    active_language: 'zh',
+    translations: { zh: '你好' }
+  };
+  const CANCEL = { type: 'subtitle_cancel', id: 'u42', reason: 'dropped' };
+
+  it('subtitle_partial：仅经 app:subtitle 分发，不写历史、不触发会话生命周期', () => {
+    const h = makeHarness();
+    h.socket.emit(PARTIAL);
+
+    expect(h.history.inserts.length).toBe(0);
+    expect(h.broadcasts.some((b) => b.channel === 'history:changed')).toBe(false);
+    const subs = h.broadcasts.filter((b) => b.channel === 'app:subtitle');
+    expect(subs.length).toBe(1);
+    expect(subs[0].payload).toMatchObject({
+      type: 'subtitle_partial', id: 'u42', translations: { zh: '你好' }
+    });
+    h.gateway.close();
+  });
+
+  it('subtitle_cancel：仅经 app:subtitle 分发，不写历史、不触发会话生命周期', () => {
+    const h = makeHarness();
+    h.socket.emit(CANCEL);
+
+    expect(h.history.inserts.length).toBe(0);
+    expect(h.broadcasts.some((b) => b.channel === 'history:changed')).toBe(false);
+    const subs = h.broadcasts.filter((b) => b.channel === 'app:subtitle');
+    expect(subs.length).toBe(1);
+    expect(subs[0].payload).toMatchObject({
+      type: 'subtitle_cancel', id: 'u42', reason: 'dropped'
+    });
+    h.gateway.close();
+  });
+
+  it('partial → 同 id 定稿：定稿照常落库并广播（既有行为保留，同通道保序）', () => {
+    const h = makeHarness();
+    h.socket.emit(PARTIAL);
+    h.socket.emit({ ...SUBTITLE, id: 'u42', first_token_ms: 312 });
+
+    expect(h.history.inserts.length).toBe(1);
+    expect(h.history.inserts[0]).toMatchObject({
+      original: 'こんにちは', translation: '你好', tsStart: 1.5, tsEnd: 3.25
+    });
+    const subs = h.broadcasts.filter((b) => b.channel === 'app:subtitle');
+    expect(subs.length).toBe(2);
+    expect(subs[0].payload).toMatchObject({ type: 'subtitle_partial', id: 'u42' });
+    expect(subs[1].payload).toMatchObject({
+      type: 'subtitle', id: 'u42', first_token_ms: 312
+    });
+    h.gateway.close();
+  });
+});
+
 describe('意图执行（client-gateway-state spec：单一动作源）', () => {
   it('togglePause：WS 帧 + 状态迁移双向一致，再次触发为 resume', () => {
     const h = makeHarness();
@@ -241,17 +299,27 @@ describe('意图执行（client-gateway-state spec：单一动作源）', () => 
     h.gateway.close();
   });
 
-  it('cycleModel：轮换 + config/state/WS 三处同步 + toast', () => {
+  it('setSourceLanguage：持久化 + 下发 set_source_language（热生效）', () => {
     const h = makeHarness();
-    h.controller.handle({ type: 'cycleModel' });
-    expect(h.state.getState().model).toBe('small');
-    expect((h.config.get('asr') as { model: string }).model).toBe('small');
+    h.controller.handle({ type: 'setSourceLanguage', language: 'zh' });
+    expect((h.config.get('asr') as { language: string }).language).toBe('zh');
     expect(h.socket.sentJson()).toContainEqual({
-      type: 'control', action: 'change_model', model_size: 'small'
+      type: 'control', action: 'set_source_language', language: 'zh'
     });
-    const toasts = h.broadcasts.filter((b) => b.channel === 'app:toast') as
-      Array<{ payload: { text: string } }>;
-    expect(toasts.some((t) => t.payload.text.includes('small'))).toBe(true);
+    h.gateway.close();
+  });
+
+  it('setSourceLanguage：同值幂等；范围外语言拒绝（无 WS 帧）', () => {
+    const h = makeHarness();
+    h.controller.handle({ type: 'setSourceLanguage', language: 'ja' }); // 默认值 → 幂等
+    expect(h.socket.sentJson().some((f) => f.action === 'set_source_language')).toBe(false);
+
+    // 运行时守卫验证：类型层排除的范围外值（模拟渲染层被绕过/后端旧版本）
+    h.controller.handle({ type: 'setSourceLanguage', language: 'ko' } as unknown as Parameters<
+      typeof h.controller.handle
+    >[0]);
+    expect(h.socket.sentJson().some((f) => f.action === 'set_source_language')).toBe(false);
+    expect((h.config.get('asr') as { language: string }).language).toBe('ja');
     h.gateway.close();
   });
 
@@ -325,38 +393,6 @@ describe('意图执行（client-gateway-state spec：单一动作源）', () => 
     h.gateway.close();
   });
 
-  it('setAudioSource：进程源 state 显示进程名、store 保存结构化源（pid→lastPid）', () => {
-    const h = makeHarness();
-    h.controller.handle({
-      type: 'setAudioSource', source: { kind: 'process', pid: 123, name: 'chrome.exe' }
-    });
-    expect(h.socket.sentJson()).toContainEqual({
-      type: 'control', action: 'set_audio_source',
-      source: { kind: 'process', pid: 123, name: 'chrome.exe' }
-    });
-    expect(h.state.getState().audioSource).toBe('chrome.exe');
-    expect((h.config.get('audio') as { source: AudioSourcePref }).source)
-      .toEqual({ kind: 'process', name: 'chrome.exe', lastPid: 123 });
-    h.gateway.close();
-  });
-
-  it('setAudioSource：同名不同实例（PID 不同）不被同值跳过', () => {
-    const h = makeHarness();
-    h.config.set('audio', {
-      source: { kind: 'process', name: 'chrome.exe', lastPid: 123 }
-    } as AppConfig['audio']);
-    h.controller.handle({
-      type: 'setAudioSource', source: { kind: 'process', pid: 456, name: 'chrome.exe' }
-    });
-    expect(h.socket.sentJson()).toContainEqual({
-      type: 'control', action: 'set_audio_source',
-      source: { kind: 'process', pid: 456, name: 'chrome.exe' }
-    });
-    expect((h.config.get('audio') as { source: AudioSourcePref }).source)
-      .toEqual({ kind: 'process', name: 'chrome.exe', lastPid: 456 });
-    h.gateway.close();
-  });
-
   it('newSession：历史库开新会话 + 状态切换 + 会话级广播', () => {
     const h = makeHarness();
     h.controller.handle({ type: 'newSession' });
@@ -377,16 +413,23 @@ describe('意图执行（client-gateway-state spec：单一动作源）', () => 
 });
 
 describe('乐观回退（settings-management spec：失败回退原值）', () => {
-  it('invalid_model 回执 → model 状态与配置回退 + 错误 toast', () => {
+  it('invalid_language 回执（源语言路径）→ asr 配置回退原值 + 错误 toast', () => {
     const h = makeHarness();
-    h.controller.handle({ type: 'setModel', model: 'small' });
-    expect(h.state.getState().model).toBe('small');
-    h.socket.emit({ type: 'error', code: 'invalid_model', message: '不支持的模型' });
-    expect(h.state.getState().model).toBe('base');
-    expect((h.config.get('asr') as { model: string }).model).toBe('base');
+    h.controller.handle({ type: 'setSourceLanguage', language: 'zh' });
+    expect((h.config.get('asr') as { language: string }).language).toBe('zh');
+    h.socket.emit({ type: 'error', code: 'invalid_language', message: '不支持的源语言' });
+    expect((h.config.get('asr') as { language: string }).language).toBe('ja');
     const errors = (h.broadcasts.filter((b) => b.channel === 'app:toast') as
       Array<{ payload: { kind: string; text: string } }>).filter((t) => t.payload.kind === 'error');
-    expect(errors.some((t) => t.payload.text.includes('不支持的模型'))).toBe(true);
+    expect(errors.some((t) => t.payload.text.includes('不支持的源语言'))).toBe(true);
+    h.gateway.close();
+  });
+
+  it('invalid_model 回执：单引擎语义下无乐观锚点，不破坏状态', () => {
+    const h = makeHarness();
+    h.socket.emit({ type: 'error', code: 'invalid_model', message: '不支持的模型' });
+    // 源语言配置不受影响（档位已移除，无回退路径）
+    expect((h.config.get('asr') as { language: string }).language).toBe('ja');
     h.gateway.close();
   });
 
@@ -429,20 +472,18 @@ describe('乐观回退（settings-management spec：失败回退原值）', () =
 
   it('invalid_audio_source 回执（对齐路径）→ 粘性重置默认设备 + 单条 warn toast', async () => {
     const h = makeHarness();
-    // store 记录进程源 → 对齐下发 → 后端拒绝（无用户乐观锚点）
-    h.config.set('audio', {
-      source: { kind: 'process', name: 'chrome.exe', lastPid: 999 }
-    } as AppConfig['audio']);
+    // store 记录非默认设备 → 对齐下发 → 后端拒绝（无用户乐观锚点）
+    h.config.set('audio', { source: { kind: 'device', id: 'dev-x' } });
     const p = h.controller.align();
     const req = h.socket.sentJson().filter((f) => f.type === 'request').pop();
     h.socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
     await p;
     expect(h.socket.sentJson()).toContainEqual({
       type: 'control', action: 'set_audio_source',
-      source: { kind: 'process', pid: 999, name: 'chrome.exe' }
+      source: { kind: 'device', id: 'dev-x' }
     });
 
-    h.socket.emit({ type: 'error', code: 'invalid_audio_source', message: '应用未运行' });
+    h.socket.emit({ type: 'error', code: 'invalid_audio_source', message: '设备不可用' });
     expect(h.state.getState().audioSource).toBe('');
     expect((h.config.get('audio') as { source: AudioSourcePref }).source)
       .toEqual({ kind: 'device', id: '' });
@@ -540,26 +581,6 @@ describe('其它广播路由', () => {
     h.socket.emit({ type: 'vad_state', state: 'bogus' });
     expect(h.state.getState().vad).toBe('speech');
     expect(() => h.socket.emit({ type: 'future_type', x: 1 })).not.toThrow();
-    h.gateway.close();
-  });
-
-  it('audio_source_lost → warn toast + store/state 粘性回默认设备（D6）', () => {
-    const h = makeHarness();
-    h.config.set('audio', {
-      source: { kind: 'process', name: 'chrome.exe', lastPid: 42 }
-    } as AppConfig['audio']);
-    h.controller.handle({ type: 'setAudioSource', source: { kind: 'process', pid: 42, name: 'chrome.exe' } });
-    h.socket.emit({ type: 'audio_source_lost', name: 'chrome.exe', pid: 42, fallback: 'system' });
-
-    expect(h.state.getState().audioSource).toBe('');
-    expect((h.config.get('audio') as { source: AudioSourcePref }).source)
-      .toEqual({ kind: 'device', id: '' });
-    const toasts = h.broadcasts.filter((b) => b.channel === 'app:toast') as
-      Array<{ payload: { kind: string; text: string } }>;
-    const lost = toasts.filter((t) => t.payload.text.includes('chrome.exe'));
-    expect(lost.length).toBe(1);
-    expect(lost[0].payload.kind).toBe('warn');
-    expect(lost[0].payload.text).toContain('已切换为整个系统');
     h.gateway.close();
   });
 });

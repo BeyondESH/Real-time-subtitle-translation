@@ -22,7 +22,6 @@ from pathlib import Path
 
 import yaml
 
-import process_loopback
 from audio_buffer import RingBuffer, UtteranceSegmenter
 from audio_capture import AudioCapture
 from asr_engine import ASREngine
@@ -87,7 +86,7 @@ class SubtitleTranslator:
         sample_rate = audio_cfg.get('sample_rate', 16000)
 
         buffer_seconds = pipeline_cfg.get('buffer_seconds', 30)
-        self._tick_interval = pipeline_cfg.get('tick_ms', 250) / 1000.0
+        self._tick_interval = pipeline_cfg.get('tick_ms', 125) / 1000.0
         queue_size = pipeline_cfg.get('queue_size', 8)
         stall_timeout_s = pipeline_cfg.get('stall_timeout_s', 30)
 
@@ -100,7 +99,7 @@ class SubtitleTranslator:
         self.segmenter = UtteranceSegmenter(
             sample_rate=sample_rate,
             threshold=vad_cfg.get('threshold', 0.5),
-            min_silence_ms=vad_cfg.get('min_silence_duration_ms', 600),
+            min_silence_ms=vad_cfg.get('min_silence_duration_ms', 400),
             speech_pad_ms=vad_cfg.get('speech_pad_ms', 200),
             max_utterance_s=pipeline_cfg.get('max_utterance_s', 15),
         )
@@ -121,11 +120,7 @@ class SubtitleTranslator:
 
         # 注册 WebSocket 请求/响应方法（设置面板使用）
         self.websocket_server.register_method('get_audio_sources', self._method_get_audio_sources)
-        self.websocket_server.register_method('get_audio_processes', self._method_get_audio_processes)
         self.websocket_server.register_method('get_config', self._method_get_config)
-
-        # 进程源退出 → watchdog 线程回调 → 切回默认设备（事件循环内编排）
-        self.audio_capture.set_source_lost_callback(self._on_audio_source_lost)
 
         # ASR 健康事件（运行期降级/持续失败）→ device_state 广播与告警
         self.asr_engine.set_health_callback(self._on_asr_health)
@@ -175,24 +170,27 @@ class SubtitleTranslator:
             'audio': {
                 'sample_rate': 16000,
                 'channels': 1,
-                'chunk_size': 1024
+                'chunk_size': 512
             },
             'pipeline': {
                 'buffer_seconds': 30,
-                'tick_ms': 250,
+                'tick_ms': 125,
                 'max_utterance_s': 15,
                 'queue_size': 8,
                 'stall_timeout_s': 30
             },
             'vad': {
                 'threshold': 0.5,
-                'min_silence_duration_ms': 600,
+                'min_silence_duration_ms': 400,
                 'speech_pad_ms': 200
             },
             'asr': {
-                'model_size': 'base',
+                'model': 'funasr-nano',
                 'device': 'auto',
-                'language': None  # 自动检测
+                'language': 'ja',  # 源语言（识别提示 + 翻译源语言；非法值回退 ja）
+                'itn': True,
+                'hotwords': '',
+                'num_threads': 2,
             },
             'translation': {
                 'default_model': 'hy-mt2-1.8b-q4km',
@@ -200,6 +198,7 @@ class SubtitleTranslator:
                 'download': {'source': 'auto'},
                 'n_ctx': 4096,
                 'timeout_s': 30,
+                'stream': True,
                 'target_languages': ['zh', 'en'],
                 'device': 'auto',
             },
@@ -281,33 +280,6 @@ class SubtitleTranslator:
         """音频块回调（录音线程，同步，只写环形缓冲）"""
         self.ring_buffer.append(audio_data)
 
-    def _on_audio_source_lost(self, name, pid):
-        """watchdog 线程回调：切回主事件循环编排回退（不阻塞捕获路径）。"""
-        logger.warning(f"进程音频源退出: {name} (pid={pid})，回退默认设备")
-        loop = self._loop
-        if loop is None or not loop.is_running():
-            return
-        loop.call_soon_threadsafe(self._schedule_source_lost, name, pid)
-
-    def _schedule_source_lost(self, name, pid):
-        """在主事件循环中调度回退处理。"""
-        asyncio.create_task(self._handle_source_lost(name, pid))
-
-    async def _handle_source_lost(self, name, pid):
-        """切回默认设备源 + 重启捕获 + 广播 audio_source_lost（事件驱动）。"""
-        try:
-            self.audio_capture.set_audio_source({'kind': 'device', 'id': ''})
-            await self.audio_capture.restart()
-        except Exception as e:  # noqa: BLE001 - 回退失败仍须告知前端
-            logger.error(f"回退默认音频源失败: {e}")
-        # 无客户端时 send 自动跳过（与既有广播一致）
-        await self.websocket_server.send({
-            'type': 'audio_source_lost',
-            'name': name,
-            'pid': pid,
-            'fallback': 'system'
-        })
-
     async def _segmentation_loop(self):
         """VAD 切句循环（事件循环线程）"""
         while self._running:
@@ -358,18 +330,6 @@ class SubtitleTranslator:
         """WS 方法：枚举音频源"""
         return await asyncio.to_thread(self.audio_capture.get_audio_sources)
 
-    async def _method_get_audio_processes(self, _params):
-        """WS 方法：枚举可捕获的应用进程（音量合成器口径）"""
-        if not process_loopback.supported():
-            return {'supported': False, 'reason': 'os_too_old', 'processes': []}
-        try:
-            processes = await asyncio.to_thread(process_loopback.list_audio_processes)
-        except process_loopback.ProcessLoopbackError as e:
-            logger.warning(f"音频进程枚举失败: {e}")
-            # 走既有请求错误机制（响应 ok=false, error=...）；code 以字符串前缀表达
-            raise RuntimeError(f'enumerate_failed: {e}') from e
-        return {'supported': True, 'reason': None, 'processes': processes}
-
     async def _method_get_config(self, _params):
         """WS 方法：返回后端运行配置摘要（含两引擎实际设备、原因与当前音频源）"""
         return {
@@ -397,9 +357,6 @@ class SubtitleTranslator:
     # ASR 健康事件：运行期降级 → 设备状态广播 + engine_degraded 告警
     # ------------------------------------------------------------------ #
 
-    # 重档模型集：CPU 上难以实时，降级时提示用户降档
-    _HEAVY_MODELS = ('medium', 'large-v3')
-
     def _on_asr_health(self, payload: dict):
         """ASR 健康回调（事件循环上下文）：调度到主事件循环处理。"""
         loop = self._loop
@@ -416,18 +373,11 @@ class SubtitleTranslator:
         event = payload.get('event')
         if event == 'runtime_degraded':
             await self._broadcast_device_state()
-            model_size = payload.get('model_size') or self.asr_engine.model_size
-            message = 'GPU 运行时不可用，已自动回退 CPU（原因：运行时推理失败）'
-            if model_size in self._HEAVY_MODELS:
-                message += (
-                    f'；当前模型 {model_size} 在 CPU 上难以实时，'
-                    '建议切换到 base/small'
-                )
             await self.websocket_server.send({
                 'type': 'pipeline_warning',
                 'reason': 'engine_degraded',
                 'dropped': self.worker.dropped_count,
-                'message': message,
+                'message': '识别引擎 GPU 运行时不可用，已自动回退 CPU（原因：运行时推理失败）',
                 'detail': {
                     'engine': 'asr',
                     'from': 'cuda',
@@ -553,9 +503,10 @@ class SubtitleTranslator:
                 return
             logger.info(f"音频源已切换: {self.audio_capture.get_current_source()}")
         elif action == 'change_model':
-            model_size = message.get('model_size', 'base')
+            # 单引擎模型语义（线格式保持 model_size 字段名；spec: pipeline-control）
+            model_id = message.get('model_size')
             try:
-                await self.asr_engine.change_model(model_size)
+                await self.asr_engine.change_model(model_id)
             except ValueError as e:
                 logger.warning(f"切换模型失败: {e}")
                 await self.websocket_server.send({
@@ -563,6 +514,19 @@ class SubtitleTranslator:
                     'code': 'invalid_model',
                     'message': str(e)
                 })
+        elif action == 'set_source_language':
+            # 源语言控制（ja/zh/en，热生效；spec: pipeline-control「源语言控制」）
+            language = message.get('language')
+            try:
+                applied = self.asr_engine.change_source_language(language)
+            except ValueError as e:
+                await self.websocket_server.send({
+                    'type': 'error',
+                    'code': 'invalid_language',
+                    'message': str(e)
+                })
+            else:
+                logger.info(f"源语言切换为: {applied}")
         elif action == 'change_llm':
             model_id = message.get('model_id')
             try:

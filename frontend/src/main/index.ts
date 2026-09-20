@@ -33,7 +33,7 @@ import {
 } from './windows/main';
 import { loadRenderer, preloadPath } from './windows/util';
 import type { DisplayInfo, EnvInfo, Intent, WsResponse } from '../shared/ipc-types';
-import { WRITABLE_CONFIG_PATHS } from '../shared/ipc-types';
+import { ENGINE_MODEL_DISPLAY, WRITABLE_CONFIG_PATHS } from '../shared/ipc-types';
 
 // ---------- 模块级组装引用（whenReady 中初始化） ----------
 
@@ -340,7 +340,6 @@ function registerShortcuts(): void {
   const status = {
     togglePause: tryRegisterShortcut(sc.togglePause, { type: 'togglePause' }),
     switchLanguage: tryRegisterShortcut(sc.switchLanguage, { type: 'cycleLanguage' }),
-    switchModel: tryRegisterShortcut(sc.switchModel, { type: 'cycleModel' }),
     toggleLock: tryRegisterShortcut(sc.toggleLock, { type: 'toggleLock' })
   };
   // 注册结果持久化，设置页警示展示（main-window spec）
@@ -350,7 +349,7 @@ function registerShortcuts(): void {
 // ---------- IPC ----------
 
 const KNOWN_INTENTS = new Set<string>([
-  'togglePause', 'cycleLanguage', 'cycleModel', 'setLanguage', 'setModel',
+  'togglePause', 'cycleLanguage', 'setLanguage', 'setSourceLanguage',
   'setLlm', 'toggleLock', 'toggleOverlay', 'setAudioSource', 'setDevice',
   'newSession', 'showSettings', 'restartBackend'
 ]);
@@ -459,7 +458,7 @@ function registerIpc(): void {
     }
     if (
       cfgPath.startsWith('translation')
-      || cfgPath === 'asr.model'
+      || cfgPath === 'asr.language'
       || cfgPath === 'inference.device'
       || cfgPath === 'audio.source'
     ) {
@@ -642,7 +641,7 @@ app.whenReady().then(() => {
   // 3. 状态机（初值来自配置）
   const wsConfig = config.get('websocket');
   state = new StateStore(createInitialState({
-    model: config.get('asr').model,
+    model: ENGINE_MODEL_DISPLAY,
     activeLanguage: config.get('translation').activeLanguage,
     targetLanguages: config.get('translation').targetLanguages,
     audioSource: audioSourceLabel(config.get('audio').source),

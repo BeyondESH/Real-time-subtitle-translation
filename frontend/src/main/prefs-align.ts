@@ -3,7 +3,8 @@
  *
  * Gateway 每次 WS 连接建立（含重连）后调用：
  * 1. 发送 config_sync（幂等）
- * 2. get_config 查询后端 ASR 模型，与 store 不一致时发 change_model
+ * 2. 源语言：get_config 回传 asr.language 且与 store 不一致时发 set_source_language
+ *    （Whisper 模型档位对齐随档位移除，MUST NOT 再按 store 模型字段发 change_model）
  * 3. 音频源：get_config 回传结构化 audio.source 时比较（一致不发/不一致发）；
  *    旧后端缺失该字段 → 用 AlignmentTracker 做"本后端会话内应用一次"的幂等
  *    （后端进程重启时由 BackendManager 调 markBackendRestarted 复位）
@@ -15,13 +16,15 @@ import type {
   DeviceEngineState, DeviceReason, DeviceResolved, DeviceStateView, GatewayLogger
 } from './types';
 import { audioSourceKey, audioSourceToTarget, sameAudioSource, type AudioSourcePref } from './config-migration';
+import type { SourceLanguage } from '../shared/ipc-types';
 
 export type { DeviceStateView } from './types';
 
 export interface PrefsSnapshot {
   targetLanguages: string[];
   activeLanguage: string;
-  model: string;
+  /** 源语言偏好（识别提示 + 翻译源语言；键 asr.language） */
+  sourceLanguage: SourceLanguage;
   /** store 翻译模型偏好（llama.cpp 注册表 id，键 translation.model） */
   translationModel: string;
   /** 结构化音频源偏好（D9/D10）：设备源或按进程源 */
@@ -32,7 +35,8 @@ export interface PrefsSnapshot {
 
 export interface BackendConfigInfo {
   asr?: {
-    model_size?: unknown;
+    /** 后端当前源语言（新引擎；旧后端为 model_size 档位字段，缺失时跳过对齐） */
+    language?: unknown;
     /** 后端当前设备偏好（兼容旧字段） */
     device?: unknown;
     resolved_device?: unknown;
@@ -94,8 +98,8 @@ function asDevicePreference(raw: unknown): 'auto' | 'cpu' | 'cuda' | null {
 }
 
 /**
- * get_config 回传的 `audio.source` → 结构化源；缺失/形状非法 → null（旧后端）。
- * 后端进程源使用 `pid`，store 进程源使用 `lastPid`，此处做映射。
+ * get_config 回传的 `audio.source` → 结构化设备源；缺失/形状非法（含回退前的
+ * 进程源形态）→ null（旧后端，走 AlignmentTracker 幂等路径）。
  */
 export function audioSourceFromConfig(raw: unknown): AudioSourcePref | null {
   if (raw === null || typeof raw !== 'object') return null;
@@ -103,14 +107,11 @@ export function audioSourceFromConfig(raw: unknown): AudioSourcePref | null {
   if (rec.kind === 'device' && typeof rec.id === 'string') {
     return { kind: 'device', id: rec.id };
   }
-  if (rec.kind === 'process' && typeof rec.name === 'string') {
-    return { kind: 'process', name: rec.name, lastPid: typeof rec.pid === 'number' ? rec.pid : null };
-  }
   return null;
 }
 
 export class AlignmentTracker {
-  /** 已应用源的稳定键（device:<id> / process:<name>） */
+  /** 已应用源的稳定键（device:<id>） */
   private appliedKey: string | null = null;
 
   /** 后端进程重启后调用：音频源需重新应用 */
@@ -149,9 +150,14 @@ export async function alignPreferences(
   let info: BackendConfigInfo | null = null;
   try {
     info = await gw.request<BackendConfigInfo>('get_config');
-    const backendModel = typeof info?.asr?.model_size === 'string' ? info.asr.model_size : null;
-    if (backendModel !== null && backendModel !== prefs.model) {
-      gw.send({ type: 'control', action: 'change_model', model_size: prefs.model });
+
+    // 源语言对齐（set_source_language）：后端回传 asr.language 且与 store 不一致时下发；
+    // 旧后端/字段缺失 → 容错跳过（档位对齐 change_model 已随 Whisper 档位移除）
+    const backendLanguage = typeof info?.asr?.language === 'string'
+      ? info.asr.language
+      : null;
+    if (backendLanguage !== null && backendLanguage !== prefs.sourceLanguage) {
+      gw.send({ type: 'control', action: 'set_source_language', language: prefs.sourceLanguage });
     }
 
     // 翻译模型对齐（change_llm）：后端回传 translation.model 且与 store 不一致时下发；
@@ -178,21 +184,18 @@ export async function alignPreferences(
     logger.warn('get_config 失败，跳过模型与设备对齐', err);
   }
 
-  // 音频源对齐（D9）：后端回传 audio.source 时比较结构化源（一致不发/不一致下发）；
-  // 旧后端缺失该字段 → 沿用 AlignmentTracker 的"本后端会话内应用一次"策略。
-  // 下发一律使用线上目标形状（进程源携带 pid；store 的 lastPid 缺省时不可下发）。
-  const target = audioSourceToTarget(prefs.audioSource);
-  const backendSource = audioSourceFromConfig(info?.audio?.source);
-  if (target === null) {
-    logger.warn('进程源缺少 PID，跳过音频源对齐', prefs.audioSource);
-  } else if (backendSource !== null) {
-    if (!sameAudioSource(prefs.audioSource, backendSource)) {
-      gw.send({ type: 'control', action: 'set_audio_source', source: target });
+    // 音频源对齐：后端回传 audio.source 时比较结构化设备源（一致不发/不一致下发）；
+    // 旧后端缺失该字段 → 沿用 AlignmentTracker 的"本后端会话内应用一次"策略。
+    const target = audioSourceToTarget(prefs.audioSource);
+    const backendSource = audioSourceFromConfig(info?.audio?.source);
+    if (backendSource !== null) {
+      if (!sameAudioSource(prefs.audioSource, backendSource)) {
+        gw.send({ type: 'control', action: 'set_audio_source', source: target });
+      }
+    } else if (tracker.needsSourceApply(prefs.audioSource)) {
+      const ok = gw.send({ type: 'control', action: 'set_audio_source', source: target });
+      if (ok) tracker.markSourceApplied(prefs.audioSource);
     }
-  } else if (tracker.needsSourceApply(prefs.audioSource)) {
-    const ok = gw.send({ type: 'control', action: 'set_audio_source', source: target });
-    if (ok) tracker.markSourceApplied(prefs.audioSource);
-  }
 
   return deviceView;
 }

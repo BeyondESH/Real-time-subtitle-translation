@@ -49,7 +49,7 @@ function makeOpenGateway(warns: unknown[][] = []) {
 const prefs = (over: Partial<PrefsSnapshot> = {}): PrefsSnapshot => ({
   targetLanguages: ['zh', 'en'],
   activeLanguage: 'zh',
-  model: 'base',
+  sourceLanguage: 'ja',
   translationModel: 'hy-mt2-1.8b-q4km',
   audioSource: { kind: 'device', id: '' },
   device: 'auto',
@@ -65,28 +65,39 @@ describe('alignPreferences', () => {
     expect(cfgFrame).toEqual({ type: 'config_sync', target_languages: ['zh', 'en'], active_language: 'zh' });
     // 回应 get_config，结束 promise
     const reqFrame = socket.sentJson().find((f) => f.type === 'request');
-    socket.emit({ type: 'response', id: reqFrame?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    socket.emit({ type: 'response', id: reqFrame?.id, ok: true, result: { asr: { language: 'ja' } } });
     await p;
   });
 
-  it('模型一致时不发 change_model（无差异不发消息）', async () => {
+  it('源语言一致时不发 set_source_language；档位对齐 change_model 不再发送', async () => {
     const { gw, socket } = makeOpenGateway();
-    const p = alignPreferences(gw, prefs({ model: 'base' }), new AlignmentTracker(), silentLogger);
+    const p = alignPreferences(gw, prefs({ sourceLanguage: 'ja' }), new AlignmentTracker(), silentLogger);
     const req = socket.sentJson().find((f) => f.type === 'request');
-    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { language: 'ja' } } });
     await p;
+    // Whisper 档位对齐随档位移除（client-gateway-state spec）
     expect(socket.sentJson().some((f) => f.action === 'change_model')).toBe(false);
+    expect(socket.sentJson().some((f) => f.action === 'set_source_language')).toBe(false);
     expect(socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
   });
 
-  it('模型不一致时下发 change_model', async () => {
+  it('源语言不一致时下发 set_source_language', async () => {
     const { gw, socket } = makeOpenGateway();
-    const p = alignPreferences(gw, prefs({ model: 'small' }), new AlignmentTracker(), silentLogger);
+    const p = alignPreferences(gw, prefs({ sourceLanguage: 'zh' }), new AlignmentTracker(), silentLogger);
     const req = socket.sentJson().find((f) => f.type === 'request');
-    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { language: 'ja' } } });
     await p;
-    const frame = socket.sentJson().find((f) => f.action === 'change_model');
-    expect(frame).toEqual({ type: 'control', action: 'change_model', model_size: 'small' });
+    const frame = socket.sentJson().find((f) => f.action === 'set_source_language');
+    expect(frame).toEqual({ type: 'control', action: 'set_source_language', language: 'zh' });
+  });
+
+  it('旧后端缺 asr.language → 容错不发 set_source_language', async () => {
+    const { gw, socket } = makeOpenGateway();
+    const p = alignPreferences(gw, prefs({ sourceLanguage: 'zh' }), new AlignmentTracker(), silentLogger);
+    const req = socket.sentJson().find((f) => f.type === 'request');
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: {} } });
+    await p;
+    expect(socket.sentJson().some((f) => f.action === 'set_source_language')).toBe(false);
   });
 
   it('get_config 失败仅告警，不崩溃不阻断音频源对齐', async () => {
@@ -109,7 +120,7 @@ describe('alignPreferences', () => {
     // 第一次连接（source 非空）
     let p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
     let req = socket.sentJson().find((f) => f.type === 'request');
-    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { language: 'ja' } } });
     await p;
     expect(socket.sentJson().filter((f) => f.action === 'set_audio_source').length).toBe(1);
 
@@ -117,7 +128,7 @@ describe('alignPreferences', () => {
     socket.sent.length = 0;
     p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
     req = socket.sentJson().find((f) => f.type === 'request');
-    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { language: 'ja' } } });
     await p;
     expect(socket.sentJson().filter((f) => f.action === 'set_audio_source').length).toBe(0);
 
@@ -126,7 +137,7 @@ describe('alignPreferences', () => {
     socket.sent.length = 0;
     p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
     req = socket.sentJson().find((f) => f.type === 'request');
-    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { language: 'ja' } } });
     await p;
     expect(socket.sentJson().filter((f) => f.action === 'set_audio_source').length).toBe(1);
   });
@@ -135,7 +146,7 @@ describe('alignPreferences', () => {
     const { gw, socket } = makeOpenGateway();
     const p = alignPreferences(gw, prefs({ audioSource: { kind: 'device', id: '' } }), new AlignmentTracker(), silentLogger);
     const req = socket.sentJson().find((f) => f.type === 'request');
-    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { language: 'ja' } } });
     await p;
     expect(socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
   });
@@ -171,51 +182,31 @@ describe('alignPreferences 音频源结构化对齐（D9）', () => {
     expect(socket.sentJson()).toContainEqual(deviceFrame('dev-2'));
   });
 
-  it('store 为进程源且后端回传同进程 → 不发；不同进程 → 下发（含 lastPid→pid 映射）', async () => {
-    const skip = await run(
-      { audioSource: { kind: 'process', name: 'chrome.exe', lastPid: 12 } },
-      { asr: { model_size: 'base' }, audio: { source: { kind: 'process', name: 'chrome.exe', pid: 99 } } }
+  it('store 为默认设备而后端为其他设备 → 下发默认设备（device:""）', async () => {
+    const { socket } = await run(
+      { audioSource: { kind: 'device', id: '' } },
+      { asr: { model_size: 'base' }, audio: { source: { kind: 'device', id: 'dev-1' } } }
     );
-    expect(skip.socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
-
-    const send = await run(
-      { audioSource: { kind: 'process', name: 'chrome.exe', lastPid: 12 } },
-      { asr: { model_size: 'base' }, audio: { source: { kind: 'device', id: '' } } }
-    );
-    expect(send.socket.sentJson()).toContainEqual({
-      type: 'control', action: 'set_audio_source',
-      source: { kind: 'process', pid: 12, name: 'chrome.exe' }
-    });
+    expect(socket.sentJson()).toContainEqual(deviceFrame(''));
   });
 
-  it('后端旧形状缺 audio.source → 走 tracker 幂等（非默认源发送一次，含 lastPid→pid 映射）', async () => {
+  it('后端旧形状缺 audio.source → 走 tracker 幂等（非默认设备发送一次）', async () => {
     const { gw, socket } = makeOpenGateway();
     const tracker = new AlignmentTracker();
-    const source = { kind: 'process' as const, name: 'chrome.exe', lastPid: 12 };
+    const source = { kind: 'device' as const, id: 'dev-1' };
     let p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
     let req = socket.sentJson().find((f) => f.type === 'request');
-    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { language: 'ja' } } });
     await p;
-    expect(socket.sentJson()).toContainEqual({
-      type: 'control', action: 'set_audio_source',
-      source: { kind: 'process', pid: 12, name: 'chrome.exe' }
-    });
+    expect(socket.sentJson()).toContainEqual(deviceFrame('dev-1'));
     expect(socket.sentJson().filter((f) => f.action === 'set_audio_source').length).toBe(1);
 
     socket.sent.length = 0;
     p = alignPreferences(gw, prefs({ audioSource: source }), tracker, silentLogger);
     req = socket.sentJson().find((f) => f.type === 'request');
-    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { model_size: 'base' } } });
+    socket.emit({ type: 'response', id: req?.id, ok: true, result: { asr: { language: 'ja' } } });
     await p;
     expect(socket.sentJson().filter((f) => f.action === 'set_audio_source').length).toBe(0);
-  });
-
-  it('进程源缺 PID（脏数据）→ 跳过下发并记警告', async () => {
-    const { socket } = await run(
-      { audioSource: { kind: 'process', name: 'chrome.exe', lastPid: null } },
-      { asr: { model_size: 'base' } }
-    );
-    expect(socket.sentJson().some((f) => f.action === 'set_audio_source')).toBe(false);
   });
 });
 

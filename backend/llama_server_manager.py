@@ -89,6 +89,55 @@ def resolve_log_dir() -> Path:
     )
 
 
+# 启动期遗留进程回收：每进程仅执行一次
+_stale_reaped = False
+
+
+def kill_stale_llama_servers() -> int:
+    """
+    回收【上次进程非正常退出】遗留的 llama-server 进程（按可执行路径过滤为本应用
+    vendor 目录下的实例，MUST NOT 误伤其它来源的同名进程）。
+
+    - Windows-only；幂等（每进程仅执行一次）；任何失败静默跳过（MUST NOT 影响启动）
+    - 背景：应用被强杀/崩溃时 BackendManager 的 taskkill 进程树清理可能未执行到位，
+      遗留进程持续占用显存（实测多个遗留实例可将 LLM 生成速度从 ~200 tok/s 拖至 47 tok/s，
+      并挤压 ASR GPU 加载）
+
+    Returns:
+        实际清理的进程数（无法判定时 0）
+    """
+    global _stale_reaped
+    if os.name != 'nt':
+        return 0
+    if _stale_reaped:
+        return 0
+    _stale_reaped = True
+    try:
+        vendor = str(resolve_vendor_root().resolve())
+        script = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | "
+            f"Where-Object {{ $_.ExecutablePath -like '{vendor}*' }} | "
+            "ForEach-Object { Write-Output $_.ProcessId; Stop-Process -Id $_.ProcessId -Force }"
+        )
+        out = subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        killed = [tok for tok in (out.stdout or '').split() if tok.strip().isdigit()]
+        if killed:
+            logger.warning(
+                "启动回收：已清理上次遗留的 llama-server 进程 %s", ','.join(killed)
+            )
+        return len(killed)
+    except Exception as e:  # noqa: BLE001 - 回收失败静默，不影响启动语义
+        logger.debug("遗留 llama-server 回收失败（忽略）: %s", e)
+        return 0
+
+
 def pick_free_port() -> int:
     """向系统申请一个空闲回环端口（bind 0）"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -229,6 +278,8 @@ class LlamaServerManager:
         Raises:
             RuntimeError: 二进制缺失 / 健康检查超时 / 启动连续失败（资源已清理）
         """
+        # 首次启动：回收上次进程非正常退出遗留的实例（幂等；非 Windows/失败 no-op）
+        kill_stale_llama_servers()
         async with self._lock:
             self._stop_requested = False
             self._restart_attempts = 0

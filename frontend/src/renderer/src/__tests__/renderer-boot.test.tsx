@@ -46,14 +46,11 @@ function makeConfig(over: Partial<AppConfigView['onboarding']> = {}): AppConfigV
     shortcuts: {
       togglePause: 'Ctrl+Shift+Space',
       switchLanguage: 'Ctrl+Shift+L',
-      switchModel: 'Ctrl+Shift+M',
       toggleLock: 'Ctrl+Shift+D'
     },
-    shortcutStatus: {
-      togglePause: true, switchLanguage: true, switchModel: true, toggleLock: true
-    },
+    shortcutStatus: { togglePause: true, switchLanguage: true, toggleLock: true },
     translation: { targetLanguages: ['zh', 'en'], activeLanguage: 'zh', model: 'hy-mt2-1.8b-q4km' },
-    asr: { model: 'base' },
+    asr: { language: 'ja' },
     inference: { device: 'auto' },
     audio: { source: { kind: 'device', id: '' } },
     locked: true,

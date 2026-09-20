@@ -11,14 +11,14 @@ audio:
   # 声道数 (1=单声道, 2=立体声)
   channels: 1
   # 音频块大小
-  chunk_size: 1024
+  chunk_size: 512
 
 # 管线设置
 pipeline:
   # 环形缓冲区容量（秒）
   buffer_seconds: 30
   # 切句分析周期（毫秒）
-  tick_ms: 250
+  tick_ms: 125
   # 单条语句最大时长（秒），超过强制切分
   max_utterance_s: 15
   # 语句队列深度（满时丢最旧并告警）
@@ -31,20 +31,24 @@ vad:
   # 语音判定阈值 (0-1)
   threshold: 0.5
   # 句尾静音判定时长（毫秒），超过则切句
-  min_silence_duration_ms: 600
+  min_silence_duration_ms: 400
   # 语句边界外扩（毫秒）
   speech_pad_ms: 200
 
-# ASR 设置
+# ASR 设置（Fun-ASR-Nano，sherpa-onnx 进程内常驻；单引擎模型，无档位）
 asr:
-  # Whisper 模型大小: tiny, base, small, medium, large-v3
-  model_size: base
-  # 设备: auto, cpu, cuda
+  # 引擎模型标识（唯一合法值；非法值回退 funasr-nano 并告警）
+  model: funasr-nano
+  # 设备: auto, cpu, cuda（auto=检测到 CUDA provider 即用 GPU，失败静默降级 CPU）
   device: auto
-  # 源语言 (null=自动检测, 或指定语言代码如 'ja', 'en', 'zh')
-  language: null
-  # 计算类型: float16, int8_float16, int8
-  compute_type: float16
+  # 源语言（识别提示 + 翻译源语言）: ja / zh / en（引擎支持范围；非法值回退 ja）
+  language: ja
+  # 逆文本规范化（数字/日期等口语形式 → 书面形式）
+  itn: true
+  # 热词（逗号分隔，提升专有名词识别；空=不启用）
+  hotwords: ''
+  # 解码线程数
+  num_threads: 2
 
 # 翻译设置（llama.cpp / llama-server sidecar）
 translation:
@@ -59,6 +63,8 @@ translation:
   n_ctx: 4096
   # 单次翻译请求超时（秒）
   timeout_s: 30
+  # 流式输出（SSE 渐进上屏，首字时延更低）；false=回退整段模式（零行为差异）
+  stream: true
   # 目标语言列表
   target_languages:
     - zh  # 中文

@@ -22,7 +22,11 @@ def silence(seconds: float) -> np.ndarray:
 
 
 class StubVad:
-    """按预设队列返回 VAD 结果（位置相对传入窗口）"""
+    """按预设队列返回 VAD 结果（位置相对传入窗口）。
+
+    约定：stub 返回的 end 与真实 Silero 输出一致，视为**已含 speech_pad 外扩**；
+    切分器算出的有效静音 = (窗口末 - stub_end) + speech_pad_samples（原始间隙 > 0 时）。
+    """
 
     def __init__(self, responses):
         self._responses = list(responses)
@@ -63,10 +67,10 @@ class TestRingBuffer:
 
 class TestUtteranceSegmenter:
     def test_silence_speech_silence_cut(self):
-        """静音/语音/静音：句尾静音达阈值后切出，含头卷"""
+        """静音/语音/静音：句尾有效静音达阈值后切出，含头卷与静音等待量"""
         buf = RingBuffer(30 * SR)
         vad = StubVad([
-            # 两次 tick 窗口均从 0 开始（第一次未消费）：语音段 4800..52800
+            # 两次 tick 窗口均从 0 开始（第一次未消费）：语音段 4800..52800（stub 约定：含 pad）
             [{'start': 4800, 'end': 52800}],
             [{'start': 4800, 'end': 52800}],
         ])
@@ -74,10 +78,10 @@ class TestUtteranceSegmenter:
 
         buf.append(silence(0.3))
         buf.append(sine(3.0))
-        buf.append(silence(0.25))  # 尾部静音 250ms < 600ms
-        assert seg.tick(buf) == []  # 语音仍在生长，不切
+        buf.append(silence(0.15))  # 原始间隙 150ms + pad 200ms = 有效静音 350ms < 400ms
+        assert seg.tick(buf) == []  # 有效静音不足，不切
 
-        buf.append(silence(1.0))   # 尾部静音累计 1.25s ≥ 600ms
+        buf.append(silence(0.5))   # 原始间隙累计 650ms + pad 200ms = 有效静音 850ms ≥ 400ms
         utterances = seg.tick(buf)
         assert len(utterances) == 1
         # 切出 = 头卷 0.3s + 语音 3.0s
@@ -85,6 +89,9 @@ class TestUtteranceSegmenter:
         # 时间戳：seg_start=4800 头卷后钳到 0，ts_end=52800/16000=3.3
         assert utterances[0].ts_start == 0.0
         assert utterances[0].ts_end == pytest.approx(3.3)
+        # 延迟埋点：切句时刻与有效静音等待量（未加 pad 起算）
+        assert utterances[0].cut_at is not None
+        assert utterances[0].silence_wait_s == pytest.approx(0.85)
         # 消费位推进到句尾
         assert seg.consumed == 4800 + 48000
         # 检出语音段后 speech_active 为 True
@@ -108,6 +115,9 @@ class TestUtteranceSegmenter:
         assert seg.consumed == 15 * SR
         assert utterances[0].ts_start == 0.0
         assert utterances[0].ts_end == pytest.approx(15.0)
+        # 强制切分路径：无静音等待（原始间隙 0），切句时刻已记录
+        assert utterances[0].silence_wait_s == 0.0
+        assert utterances[0].cut_at is not None
 
         buf.append(silence(1.0))
         utterances = seg.tick(buf)
@@ -116,6 +126,8 @@ class TestUtteranceSegmenter:
         # 第二段：base=240000，seg 0..80000 → ts_start=(240000-4800)/16000=14.7，ts_end=20.0
         assert utterances[0].ts_start == pytest.approx(14.7)
         assert utterances[0].ts_end == pytest.approx(20.0)
+        # 有效静音 = 原始间隙 1.0s + pad 0.2s
+        assert utterances[0].silence_wait_s == pytest.approx(1.2)
 
     def test_pure_silence_no_emit(self):
         """纯静音：不切句，消费位推进但保留头卷"""
@@ -146,6 +158,10 @@ class TestUtteranceSegmenter:
         buf.append(silence(1.0))
         utterances = seg.tick(buf)
         assert len(utterances) == 2
+        # 埋点语义：非末段未触发切分判定 → 无静音等待量；末段有效静音 = 1.0s + 0.2s
+        assert utterances[0].silence_wait_s is None
+        assert utterances[1].silence_wait_s == pytest.approx(1.2)
+        assert all(u.cut_at is not None for u in utterances)
         assert seg.consumed == 41600
 
     def test_buffer_overflow_resync(self):
@@ -191,3 +207,33 @@ class TestUtteranceSegmenter:
         seg.tick(buf)
         assert seg.speech_active is False
         assert vad.calls == 2
+
+    def test_speech_pad_does_not_delay_cut(self):
+        """外扩不推迟切句：有效静音 = 原始间隙 + speech_pad 外扩"""
+        buf = RingBuffer(30 * SR)
+        vad = StubVad([[{'start': 3200, 'end': 35200}]])
+        seg = UtteranceSegmenter(sample_rate=SR, vad_fn=vad)  # min_silence 400ms / pad 200ms
+
+        buf.append(silence(0.2))
+        buf.append(sine(2.0))
+        buf.append(silence(0.25))  # 原始间隙 250ms < 400ms，但 +200ms 外扩 = 450ms ≥ 400ms
+        utterances = seg.tick(buf)
+        assert len(utterances) == 1  # 外扩被计入，切句未被推迟
+        assert utterances[0].silence_wait_s == pytest.approx(0.45)
+
+    def test_window_clamp_no_pad_addback(self):
+        """窗口末端截断（原始间隙为 0）时不加回 pad：即使 pad 本身足以满足阈值也不切"""
+        buf = RingBuffer(30 * SR)
+        seg_response = {'start': 0, 'end': 33600}
+        vad = StubVad([[seg_response], [seg_response]])
+        # min_silence(150ms) < pad(200ms)：若错误地加回 pad 会在首个 tick 立刻误切
+        seg = UtteranceSegmenter(sample_rate=SR, vad_fn=vad, min_silence_ms=150)
+
+        buf.append(silence(0.1))
+        buf.append(sine(2.0))  # stub end == 窗口末（模拟 pad 被窗口截断）
+        assert seg.tick(buf) == []
+
+        buf.append(silence(0.2))  # 出现真实间隙（200ms）后按 间隙+pad 判定 → 切
+        utterances = seg.tick(buf)
+        assert len(utterances) == 1
+        assert utterances[0].silence_wait_s == pytest.approx(0.4)

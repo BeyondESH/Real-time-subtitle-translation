@@ -46,4 +46,25 @@ foreach ($c in $Components) {
     [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest, $true)
 }
 
-Write-Host 'vendor 完成。冒烟: backend/vendor/llama/win-x64-cuda/llama-server.exe --list-devices'
+# ---- ORT (sherpa-onnx) CUDA EP 运行库：cudnn9 / cufft / nvrtc / nvjitlink ----
+# 识别引擎（Fun-ASR-Nano/sherpa-onnx CUDA 变体）经独立 onnxruntime CUDA EP 推理，
+# 需 cuDNN9 全套 + cufft64_11 + nvrtc + nvjitlink（缺失时报 126 / Failed to load shared library）。
+# 来源：NVIDIA pip 包（nvidia-*）；复制进 win-x64-cuda 后由引擎启动时的 PATH 注入解析。
+Write-Host '[pip] nvidia cudnn/cufft/nvrtc/nvjitlink (cu12)'
+python -m pip install --quiet nvidia-cudnn-cu12 nvidia-cufft-cu12 nvidia-cuda-nvrtc-cu12 nvidia-nvjitlink-cu12
+if ($LASTEXITCODE -ne 0) { throw 'nvidia 运行库 pip 安装失败' }
+$SitePackages = (python -c "import site; print(site.getsitepackages()[0])").Trim()
+$CudaDest = Join-Path $VendorRoot 'win-x64-cuda'
+New-Item -ItemType Directory -Force -Path $CudaDest | Out-Null
+foreach ($sub in @('cudnn\bin', 'cufft\bin', 'cuda_nvrtc\bin', 'nvjitlink\bin')) {
+    $src = Join-Path $SitePackages "nvidia\$sub"
+    if (Test-Path $src) {
+        Copy-Item (Join-Path $src '*.dll') $CudaDest -Force
+        Write-Host "[copy] $src\*.dll -> $CudaDest"
+    } else {
+        Write-Host "[warn] 未找到 $src（跳过）"
+    }
+}
+
+Write-Host 'vendor 完成。冒烟: backend/vendor/llama/win-x64-cuda/llama-server.exe --list-devices；'
+Write-Host '识别 GPU 冒烟: python -X utf8 backend/scripts/try_cuda_load.py（需已下载 ASR 模型）'
